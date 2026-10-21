@@ -28,12 +28,16 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    """Get database URL from application settings or alembic config."""
+    """Get database URL from alembic config or application settings."""
+    url = config.get_main_option("sqlalchemy.url")
+    default_dev_url = "postgresql://sentinel_user:sentinel_dev_password@localhost:5432/sentinel_db"
+    if url and url != default_dev_url:
+        return url
+
     try:
         return get_settings().DATABASE_URL
     except (ValueError, KeyError, TypeError, OSError):
-        url = config.get_main_option("sqlalchemy.url")
-        return url or "postgresql://sentinel_user:sentinel_dev_password@localhost:5432/sentinel_db"
+        return url or default_dev_url
 
 
 def run_migrations_offline() -> None:
@@ -58,21 +62,32 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
-    In this scenario we need to create an Engine and associate a
-    connection with the context.
+    Supports both engine creation from configuration and injecting an existing
+    Connection via config.attributes['connection'] (e.g., for test suites).
     """
-    configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = get_url()
+    connectable = config.attributes.get("connection", None)
 
-    connectable = engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    if connectable is None:
+        configuration = config.get_section(config.config_ini_section, {})
+        configuration["sqlalchemy.url"] = get_url()
 
-    with connectable.connect() as connection:
+        connectable = engine_from_config(
+            configuration,
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+        )
+
+        with connectable.connect() as connection:
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+            )
+
+            with context.begin_transaction():
+                context.run_migrations()
+    else:
         context.configure(
-            connection=connection,
+            connection=connectable,
             target_metadata=target_metadata,
         )
 

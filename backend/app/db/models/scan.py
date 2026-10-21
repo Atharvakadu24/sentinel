@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from app.db.models.finding import Finding
     from app.db.models.observability import AIReview
     from app.db.models.project import Project
+    from app.db.models.user import User
 
 
 class Scan(Base, UUIDPrimaryKeyMixin):
@@ -111,14 +112,18 @@ class Scan(Base, UUIDPrimaryKeyMixin):
 
     # Relationships
     project: Mapped[Project] = relationship(back_populates="scans")
+    created_by_user: Mapped[User | None] = relationship(foreign_keys=[created_by_user_id])
+    rerun_scan: Mapped[Scan | None] = relationship(
+        remote_side="Scan.id", foreign_keys=[rerun_of]
+    )
     job: Mapped[Job | None] = relationship(
-        back_populates="scan", uselist=False, cascade="all, delete-orphan"
+        back_populates="scan", uselist=False, cascade="all, delete-orphan", passive_deletes=True
     )
     scan_findings: Mapped[list[ScanFinding]] = relationship(
-        back_populates="scan", cascade="all, delete-orphan"
+        back_populates="scan", cascade="all, delete-orphan", passive_deletes=True
     )
     ai_review: Mapped[AIReview | None] = relationship(
-        back_populates="scan", uselist=False, cascade="all, delete-orphan"
+        back_populates="scan", uselist=False, cascade="all, delete-orphan", passive_deletes=True
     )
 
 

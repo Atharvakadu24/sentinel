@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, ORMExecuteState, Session, mapped_column, relationship
 
 from app.db.base import Base, UUIDPrimaryKeyMixin, utc_now
 
@@ -96,11 +96,16 @@ class Finding(Base, UUIDPrimaryKeyMixin):
 
     # Relationships
     project: Mapped[Project] = relationship(back_populates="findings")
+    first_seen_scan: Mapped[Scan | None] = relationship(foreign_keys=[first_seen_scan_id])
+    last_seen_scan: Mapped[Scan | None] = relationship(foreign_keys=[last_seen_scan_id])
+    status_updated_by_user: Mapped[User | None] = relationship(
+        foreign_keys=[status_updated_by]
+    )
     scan_findings: Mapped[list[ScanFinding]] = relationship(
-        back_populates="finding", cascade="all, delete-orphan"
+        back_populates="finding", cascade="all, delete-orphan", passive_deletes=True
     )
     status_history: Mapped[list[FindingStatusHistory]] = relationship(
-        back_populates="finding", cascade="all, delete-orphan"
+        back_populates="finding", cascade="all, delete-orphan", passive_deletes=True
     )
 
 
@@ -147,3 +152,41 @@ class FindingStatusHistory(Base, UUIDPrimaryKeyMixin):
     finding: Mapped[Finding] = relationship(back_populates="status_history")
     actor_user: Mapped[User | None] = relationship()
     scan: Mapped[Scan | None] = relationship()
+
+
+@sa.event.listens_for(FindingStatusHistory, "before_update")
+def _prevent_finding_status_history_update(
+    mapper: sa.orm.Mapper[FindingStatusHistory],
+    connection: sa.Connection,
+    target: FindingStatusHistory,
+) -> None:
+    """Enforce Blueprint Section 8.1 append-only audit invariant against updates."""
+    raise sa.exc.InvalidRequestError(
+        "FindingStatusHistory is an append-only audit log and cannot be updated."
+    )
+
+
+@sa.event.listens_for(FindingStatusHistory, "before_delete")
+def _prevent_finding_status_history_delete(
+    mapper: sa.orm.Mapper[FindingStatusHistory],
+    connection: sa.Connection,
+    target: FindingStatusHistory,
+) -> None:
+    """Enforce Blueprint Section 8.1 append-only audit invariant against direct deletes."""
+    raise sa.exc.InvalidRequestError(
+        "FindingStatusHistory is an append-only audit log and cannot be deleted directly."
+    )
+
+
+@sa.event.listens_for(Session, "do_orm_execute")
+def _prevent_finding_status_history_bulk_dml(
+    orm_execute_state: ORMExecuteState,
+) -> None:
+    """Enforce Blueprint Section 8.1 append-only audit invariant against bulk ORM DML."""
+    if orm_execute_state.is_update or orm_execute_state.is_delete:
+        entity = orm_execute_state.bind_mapper
+        if entity is not None and issubclass(entity.class_, FindingStatusHistory):
+            action = "updated" if orm_execute_state.is_update else "deleted"
+            raise sa.exc.InvalidRequestError(
+                f"FindingStatusHistory is an append-only audit log and cannot be {action} via bulk DML."
+            )
