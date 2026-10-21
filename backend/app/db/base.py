@@ -23,9 +23,13 @@ JSONType = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
 class Base(DeclarativeBase):
     """Base declarative class for all Sentinel SQLAlchemy models."""
 
-    type_annotation_map: ClassVar[dict[type[Any], Any]] = {
+    type_annotation_map: ClassVar[dict[Any, Any]] = {
         dict: JSONType,
         list: JSONType,
+        dict[str, Any]: JSONType,
+        list[Any]: JSONType,
+        dict[str, int]: JSONType,
+        list[dict[str, Any]]: JSONType,
     }
 
 
