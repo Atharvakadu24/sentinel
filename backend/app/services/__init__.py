@@ -1,5 +1,10 @@
 """Application service layer for Sentinel workflows."""
 
+from app.services.job_service import (
+    JobClaimError,
+    JobServiceError,
+    claim_next_job,
+)
 from app.services.scan_service import (
     ProjectNotFoundError,
     ScanConflictError,
@@ -17,6 +22,8 @@ from app.services.scan_service import (
 )
 
 __all__ = [
+    "JobClaimError",
+    "JobServiceError",
     "ProjectNotFoundError",
     "ScanConflictError",
     "ScanNotFoundError",
@@ -24,6 +31,7 @@ __all__ = [
     "ScanServiceError",
     "ScanValidationError",
     "UserNotFoundError",
+    "claim_next_job",
     "create_manual_scan",
     "create_scan_and_job",
     "get_scan",
