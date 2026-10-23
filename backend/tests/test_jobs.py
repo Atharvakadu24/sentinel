@@ -33,7 +33,18 @@ from app.db.base import Base, utc_now
 from app.db.models import Job, Project, Scan, User
 from app.services.job_service import (
     JobClaimError,
+    JobCompleteError,
+    JobFailureError,
+    JobInvalidStateError,
+    JobNotFoundError,
+    JobOwnershipError,
+    JobServiceError,
+    JobTransitionError,
     claim_next_job,
+    complete_job,
+    fail_job,
+    retry_job,
+    sanitize_failure_message,
 )
 
 
@@ -175,9 +186,52 @@ class TestJobClaimBasic:
         assert locked_until_utc >= expected_expiry - timedelta(seconds=2)
         assert locked_until_utc <= expected_expiry + timedelta(seconds=5)
 
-        # Verify associated scan status is updated to 'running'
+        # Verify associated scan status is updated to 'running' and started_at is recorded
         assert claimed.scan is not None
         assert claimed.scan.status == "running"
+        assert claimed.scan.started_at is not None
+
+    def test_claim_sets_scan_started_at_and_complete_uses_it_for_duration(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """claim_next_job sets scan.started_at and complete_job calculates duration from started_at, not queued_at."""
+        t_queue = datetime(2026, 10, 23, 10, 0, 0, tzinfo=UTC)
+        scan, job = _create_test_scan_and_job(
+            db_session,
+            sample_project,
+            run_after=t_queue,
+            created_at=t_queue,
+        )
+        scan.queued_at = t_queue
+        db_session.commit()
+
+        # Scan waited in queue for 1 hour before worker claims it
+        t_claim = datetime(2026, 10, 23, 11, 0, 0, tzinfo=UTC)
+        claimed = claim_next_job(db_session, worker_id="w-duration-check", now=t_claim)
+        assert claimed is not None
+        assert claimed.scan is not None
+        assert claimed.scan.status == "running"
+        assert claimed.scan.started_at is not None
+        started_at_utc = (
+            claimed.scan.started_at
+            if claimed.scan.started_at.tzinfo is not None
+            else claimed.scan.started_at.replace(tzinfo=UTC)
+        )
+        assert started_at_utc == t_claim
+
+        # Complete after 15 seconds of execution
+        t_complete = t_claim + timedelta(seconds=15)
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-duration-check",
+            now=t_complete,
+        )
+        assert completed.scan is not None
+        # Duration must be 15,000 ms (15s of execution), NOT 3,615,000 ms (from queued_at)
+        assert completed.scan.duration_ms == 15000
 
     def test_claim_with_custom_lease_duration(
         self,
@@ -185,8 +239,8 @@ class TestJobClaimBasic:
         sample_project: Project,
     ) -> None:
         """Custom lease duration sets locked_until accordingly."""
-        _create_test_scan_and_job(db_session, sample_project)
         now_ref = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        _create_test_scan_and_job(db_session, sample_project, run_after=now_ref)
 
         claimed = claim_next_job(
             session=db_session,
@@ -689,3 +743,1089 @@ class TestPostgresDialectCompilation:
 
         assert "FOR UPDATE SKIP LOCKED" in compiled
         assert "RETURNING" in compiled
+
+
+class TestJobCompletion:
+    """Tests for successful job completion and scan status synchronization."""
+
+    def test_complete_job_success(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Claimed job is completed: job status='succeeded', scan='succeeded', locks cleared, payload nulled."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        t0 = utc_now()
+        claimed = claim_next_job(db_session, worker_id="w-complete", lease_duration_sec=60, now=t0)
+        assert claimed is not None
+        assert claimed.status == "running"
+        assert claimed.payload is not None
+
+        t1 = t0 + timedelta(seconds=5)
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-complete",
+            scan_status="succeeded",
+            now=t1,
+        )
+
+        assert completed.id == job.id
+        assert completed.status == "succeeded"
+        assert completed.locked_by is None
+        assert completed.locked_until is None
+        assert completed.payload is None
+
+        # Verify associated scan synchronization
+        assert completed.scan is not None
+        assert completed.scan.status == "succeeded"
+        assert completed.scan.finished_at is not None
+        assert completed.scan.duration_ms is not None
+        assert completed.scan.duration_ms >= 0
+
+    def test_complete_job_partial_scan_status(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Scan can be marked 'partial' on completion when some components failed or were truncated."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w-partial")
+
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-partial",
+            scan_status="partial",
+        )
+
+        assert completed.status == "succeeded"
+        assert completed.scan.status == "partial"
+
+    def test_complete_job_null_payload_false_preserves_payload(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When null_payload=False, payload is preserved on completion."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w-keep-payload")
+
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-keep-payload",
+            null_payload=False,
+        )
+
+        assert completed.status == "succeeded"
+        assert completed.payload is not None
+
+    def test_complete_job_invalid_scan_status_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """scan_status must be 'succeeded' or 'partial'; other statuses raise ValueError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        with pytest.raises(ValueError, match="scan_status must be 'succeeded' or 'partial'"):
+            complete_job(db_session, job_id=job.id, worker_id="w", scan_status="failed")
+
+    def test_complete_job_invalid_worker_id_or_job_id_rejected(
+        self,
+        db_session: Session,
+    ) -> None:
+        """Empty worker_id or invalid job_id raises ValueError."""
+        valid_uuid = uuid.uuid4()
+        with pytest.raises(ValueError, match="worker_id must be a non-empty string"):
+            complete_job(db_session, job_id=valid_uuid, worker_id="   ")
+
+        with pytest.raises(TypeError, match="job_id must be a UUID"):
+            complete_job(db_session, job_id="not-a-uuid", worker_id="w")  # type: ignore[arg-type]
+
+    def test_complete_job_not_found(
+        self,
+        db_session: Session,
+    ) -> None:
+        """Attempting to complete a non-existent job raises JobNotFoundError."""
+        with pytest.raises(JobNotFoundError, match="does not exist"):
+            complete_job(db_session, job_id=uuid.uuid4(), worker_id="w")
+
+    def test_complete_job_wrong_worker_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to complete a job owned by a different worker raises JobOwnershipError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="worker-right")
+
+        with pytest.raises(
+            JobOwnershipError, match="is locked by worker 'worker-right', not 'worker-wrong'"
+        ):
+            complete_job(db_session, job_id=job.id, worker_id="worker-wrong")
+
+        # Job in session remains running and locked by original worker
+        reloaded = db_session.get(Job, job.id)
+        assert reloaded is not None
+        assert reloaded.status == "running"
+        assert reloaded.locked_by == "worker-right"
+
+    def test_complete_job_expired_lease_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to complete a job after its claim lease has expired raises JobOwnershipError."""
+        t0 = utc_now()
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="worker-slow", lease_duration_sec=60, now=t0)
+
+        t_expired = t0 + timedelta(seconds=120)
+        with pytest.raises(JobOwnershipError, match="Lease for job .* expired"):
+            complete_job(db_session, job_id=job.id, worker_id="worker-slow", now=t_expired)
+
+    def test_complete_job_exact_lease_expiry_boundary_accepted(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Completion is accepted when now == locked_until (inclusive lease predicate)."""
+        t0 = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claimed = claim_next_job(db_session, worker_id="w-boundary", lease_duration_sec=60, now=t0)
+        assert claimed is not None
+
+        locked_until = t0 + timedelta(seconds=60)
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-boundary",
+            now=locked_until,
+        )
+        assert completed.status == "succeeded"
+
+    def test_complete_job_microsecond_past_lease_expiry_rejected_without_committing_staged_work(
+        self,
+        session_factory: sessionmaker[Session],
+        sample_project: Project,
+    ) -> None:
+        """Completion rejected when now == locked_until + 1us and caller staged work is not committed."""
+        t0 = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        with session_factory() as s1:
+            _, job = _create_test_scan_and_job(s1, sample_project, run_after=t0)
+            claimed = claim_next_job(s1, worker_id="w-exact", lease_duration_sec=60, now=t0)
+            assert claimed is not None
+
+        locked_until = t0 + timedelta(seconds=60)
+        past_expiry = locked_until + timedelta(microseconds=1)
+
+        with session_factory() as s2:
+            staged_user = User(
+                id=uuid.uuid4(),
+                github_user_id=777888,
+                github_login="staged-boundary-user",
+            )
+            s2.add(staged_user)
+            s2.flush()
+
+            with pytest.raises(JobOwnershipError, match="Lease for job .* expired"):
+                complete_job(
+                    s2,
+                    job_id=job.id,
+                    worker_id="w-exact",
+                    now=past_expiry,
+                    auto_commit=True,
+                )
+
+            s2.rollback()
+
+        with session_factory() as s3:
+            assert s3.get(User, staged_user.id) is None
+
+    def test_complete_job_already_terminal_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to complete a job that is already succeeded raises JobInvalidStateError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+        complete_job(db_session, job_id=job.id, worker_id="w")
+
+        # Second completion attempt must fail
+        with pytest.raises(
+            JobInvalidStateError, match="is in status 'succeeded', expected 'running'"
+        ):
+            complete_job(db_session, job_id=job.id, worker_id="w")
+
+    def test_complete_job_not_running_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to complete an unclaimed queued job raises JobInvalidStateError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+
+        with pytest.raises(JobInvalidStateError, match="is in status 'queued', expected 'running'"):
+            complete_job(db_session, job_id=job.id, worker_id="w")
+
+    def test_complete_job_autocommit_false_leaves_commit_to_caller(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """With auto_commit=False, completed state is flushed but caller rollback reverts it."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        completed = complete_job(db_session, job_id=job.id, worker_id="w", auto_commit=False)
+        assert completed.status == "succeeded"
+
+        # Explicitly roll back caller transaction
+        db_session.rollback()
+
+        # Job is restored to running
+        reloaded = db_session.get(Job, job.id)
+        assert reloaded is not None
+        assert reloaded.status == "running"
+
+    def test_complete_job_invalid_transition_does_not_commit_unrelated_work(
+        self,
+        session_factory: sessionmaker[Session],
+        sample_project: Project,
+    ) -> None:
+        """When complete_job fails ownership or validation, staged caller work is not committed."""
+        with session_factory() as s1:
+            _, job = _create_test_scan_and_job(s1, sample_project)
+            claim_next_job(s1, worker_id="w-owner")
+
+        with session_factory() as s2:
+            staged_user = User(
+                id=uuid.uuid4(),
+                github_user_id=111222,
+                github_login="staged-complete-dev",
+            )
+            s2.add(staged_user)
+            s2.flush()
+
+            # Attempt completion with wrong worker
+            with pytest.raises(JobOwnershipError):
+                complete_job(s2, job_id=job.id, worker_id="w-intruder", auto_commit=True)
+
+            # Roll back caller session
+            s2.rollback()
+
+        # In independent session, verify staged user was not committed
+        with session_factory() as s3:
+            persisted = s3.get(User, staged_user.id)
+            assert persisted is None
+
+    def test_complete_job_database_error_rolls_back_and_sanitizes(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Database errors during completion trigger rollback and raise sanitized JobCompleteError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        leak_text = "FATAL: connection terminated to postgresql://secret:pass@db:5432"
+        with (
+            patch.object(
+                db_session,
+                "commit",
+                side_effect=OperationalError("db fail", {}, Exception(leak_text)),
+            ),
+            pytest.raises(JobCompleteError) as exc_info,
+        ):
+            complete_job(db_session, job_id=job.id, worker_id="w")
+
+        assert str(exc_info.value) == "Database error while completing job"
+        assert leak_text not in str(exc_info.value)
+        assert exc_info.value.__cause__ is not None
+        assert leak_text in str(exc_info.value.__cause__)
+
+    def test_complete_job_clears_stale_errors_on_success(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Transient retry failure followed by successful completion clears error_code and error_message."""
+        _, job = _create_test_scan_and_job(
+            db_session,
+            sample_project,
+            attempts=0,
+            max_attempts=3,
+        )
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w1", now=t0)
+        retry_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w1",
+            error_message="Temporary rate limit error",
+            error_code="RATE_LIMITED",
+            now=t0,
+        )
+        reloaded_scan = db_session.get(Scan, job.scan_id)
+        assert reloaded_scan is not None
+        assert reloaded_scan.error_code == "RATE_LIMITED"
+        assert reloaded_scan.error_message == "Temporary rate limit error"
+
+        # Reclaim and complete successfully
+        t1 = t0 + timedelta(seconds=120)
+        claim_next_job(db_session, worker_id="w2", now=t1)
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w2",
+            scan_status="succeeded",
+            now=t1 + timedelta(seconds=5),
+        )
+        assert completed.scan is not None
+        assert completed.scan.status == "succeeded"
+        assert completed.scan.error_code is None
+        assert completed.scan.error_message is None
+
+    def test_complete_job_partial_scan_preserves_errors(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Completing with scan_status='partial' preserves pre-existing error_code and error_message."""
+        scan, job = _create_test_scan_and_job(db_session, sample_project)
+        scan.error_code = "PARTIAL_TIMEOUT"
+        scan.error_message = "Partial scanner failed"
+        db_session.commit()
+
+        claim_next_job(db_session, worker_id="w-partial")
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-partial",
+            scan_status="partial",
+        )
+        assert completed.scan is not None
+        assert completed.scan.status == "partial"
+        assert completed.scan.error_code == "PARTIAL_TIMEOUT"
+        assert completed.scan.error_message == "Partial scanner failed"
+
+
+class TestJobFailure:
+    """Tests for recording failure on claimed jobs and synchronizing scans."""
+
+    def test_fail_job_permanent_success(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Permanent failure: job status='failed', scan='failed', locks cleared, payload nulled."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-fail", lease_duration_sec=60, now=t0)
+
+        t1 = t0 + timedelta(seconds=10)
+        failed = fail_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-fail",
+            error_message="Semgrep process crashed with OOM",
+            error_code="SEMGREP_OOM",
+            retryable=False,
+            now=t1,
+        )
+
+        assert failed.id == job.id
+        assert failed.status == "failed"
+        assert failed.locked_by is None
+        assert failed.locked_until is None
+        assert failed.payload is None
+        assert failed.last_error == "Semgrep process crashed with OOM"
+
+        # Scan synchronized
+        assert failed.scan is not None
+        assert failed.scan.status == "failed"
+        assert failed.scan.error_code == "SEMGREP_OOM"
+        assert failed.scan.error_message == "Semgrep process crashed with OOM"
+        assert failed.scan.finished_at is not None
+        assert failed.scan.duration_ms is not None
+        assert failed.scan.duration_ms >= 0
+
+    def test_fail_job_with_custom_terminal_status_dead(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """terminal_job_status='dead' marks the job as dead while scan is marked failed."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        failed = fail_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w",
+            terminal_job_status="dead",
+        )
+
+        assert failed.status == "dead"
+        assert failed.scan.status == "failed"
+
+    def test_fail_job_invalid_terminal_status_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """terminal_job_status must be 'failed' or 'dead'; other values raise ValueError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        with pytest.raises(ValueError, match="terminal_job_status must be 'failed' or 'dead'"):
+            fail_job(db_session, job_id=job.id, worker_id="w", terminal_job_status="canceled")
+
+    def test_fail_job_sanitizes_message_details(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Sensitive credentials, DB URLs, and secrets in error_message are redacted."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w-sanitize")
+
+        raw_dirty_message = (
+            "Crash connecting to postgresql+psycopg://dbuser:supersecretpass@10.0.0.1:5432/appdb. "
+            "Found token ghp_ABCDEF1234567890abcdef1234567890 in scanner payload."
+        )
+
+        failed = fail_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-sanitize",
+            error_message=raw_dirty_message,
+        )
+
+        assert failed.last_error is not None
+        assert "supersecretpass" not in failed.last_error
+        assert "ghp_ABCDEF1234567890abcdef1234567890" not in failed.last_error
+        assert "[REDACTED_DATABASE_URL]" in failed.last_error
+        assert "[REDACTED_SECRET]" in failed.last_error
+        assert failed.scan.error_message == failed.last_error
+
+    def test_fail_job_not_found(
+        self,
+        db_session: Session,
+    ) -> None:
+        """Failing a non-existent job raises JobNotFoundError."""
+        with pytest.raises(JobNotFoundError, match="does not exist"):
+            fail_job(db_session, job_id=uuid.uuid4(), worker_id="w")
+
+    def test_fail_job_wrong_worker_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to fail a job locked by a different worker raises JobOwnershipError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="worker-actual")
+
+        with pytest.raises(
+            JobOwnershipError, match="is locked by worker 'worker-actual', not 'worker-other'"
+        ):
+            fail_job(db_session, job_id=job.id, worker_id="worker-other")
+
+        reloaded = db_session.get(Job, job.id)
+        assert reloaded is not None
+        assert reloaded.status == "running"
+
+    def test_fail_job_expired_lease_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to fail a job after lease expiry raises JobOwnershipError."""
+        t0 = utc_now()
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w-stale", lease_duration_sec=60, now=t0)
+
+        t_expired = t0 + timedelta(seconds=100)
+        with pytest.raises(JobOwnershipError, match="Lease for job .* expired"):
+            fail_job(db_session, job_id=job.id, worker_id="w-stale", now=t_expired)
+
+    def test_fail_job_exact_lease_expiry_boundary_accepted(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Failure recording is accepted when now == locked_until (inclusive lease predicate)."""
+        t0 = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claimed = claim_next_job(
+            db_session, worker_id="w-fail-boundary", lease_duration_sec=60, now=t0
+        )
+        assert claimed is not None
+
+        locked_until = t0 + timedelta(seconds=60)
+        failed = fail_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-fail-boundary",
+            now=locked_until,
+        )
+        assert failed.status == "failed"
+
+    def test_fail_job_microsecond_past_lease_expiry_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Failure recording is rejected when now == locked_until + 1us."""
+        t0 = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claimed = claim_next_job(
+            db_session, worker_id="w-fail-boundary-2", lease_duration_sec=60, now=t0
+        )
+        assert claimed is not None
+
+        locked_until = t0 + timedelta(seconds=60)
+        past_expiry = locked_until + timedelta(microseconds=1)
+        with pytest.raises(JobOwnershipError, match="Lease for job .* expired"):
+            fail_job(
+                db_session,
+                job_id=job.id,
+                worker_id="w-fail-boundary-2",
+                now=past_expiry,
+            )
+
+    def test_fail_job_already_terminal_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to fail an already-failed job raises JobInvalidStateError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+        fail_job(db_session, job_id=job.id, worker_id="w")
+
+        with pytest.raises(JobInvalidStateError, match="is in status 'failed', expected 'running'"):
+            fail_job(db_session, job_id=job.id, worker_id="w")
+
+    def test_fail_job_autocommit_false_leaves_commit_to_caller(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """With auto_commit=False, caller rollback reverts the failure."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        failed = fail_job(db_session, job_id=job.id, worker_id="w", auto_commit=False)
+        assert failed.status == "failed"
+
+        db_session.rollback()
+
+        reloaded = db_session.get(Job, job.id)
+        assert reloaded is not None
+        assert reloaded.status == "running"
+
+    def test_fail_job_invalid_transition_does_not_commit_unrelated_work(
+        self,
+        session_factory: sessionmaker[Session],
+        sample_project: Project,
+    ) -> None:
+        """When fail_job fails, staged unrelated work is not committed."""
+        with session_factory() as s1:
+            _, job = _create_test_scan_and_job(s1, sample_project)
+            claim_next_job(s1, worker_id="w-real")
+
+        with session_factory() as s2:
+            staged_user = User(
+                id=uuid.uuid4(),
+                github_user_id=333444,
+                github_login="staged-fail-dev",
+            )
+            s2.add(staged_user)
+            s2.flush()
+
+            with pytest.raises(JobOwnershipError):
+                fail_job(s2, job_id=job.id, worker_id="w-fake", auto_commit=True)
+
+            s2.rollback()
+
+        with session_factory() as s3:
+            persisted = s3.get(User, staged_user.id)
+            assert persisted is None
+
+    def test_fail_job_database_error_rolls_back_and_sanitizes(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Database errors during fail_job trigger rollback and raise sanitized JobFailureError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        driver_err = "psycopg.OperationalError: server closed connection unexpectedly"
+        with (
+            patch.object(
+                db_session,
+                "commit",
+                side_effect=OperationalError("db fail", {}, Exception(driver_err)),
+            ),
+            pytest.raises(JobFailureError) as exc_info,
+        ):
+            fail_job(db_session, job_id=job.id, worker_id="w")
+
+        assert str(exc_info.value) == "Database error while recording job failure"
+        assert driver_err not in str(exc_info.value)
+        assert exc_info.value.__cause__ is not None
+        assert driver_err in str(exc_info.value.__cause__)
+
+
+class TestJobRetryAndMaxAttempts:
+    """Tests for retryable failure, delayed requeue, and max-attempt exhaustion."""
+
+    def test_retry_job_requeues_when_attempts_under_max(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """A retryable failure when attempts < max_attempts requeues the job and sets run_after in future."""
+        _, job = _create_test_scan_and_job(
+            db_session,
+            sample_project,
+            attempts=0,
+            max_attempts=3,
+        )
+        t0 = utc_now()
+        # Claim increments attempts from 0 to 1
+        claimed = claim_next_job(db_session, worker_id="w-retry", lease_duration_sec=60, now=t0)
+        assert claimed is not None
+        assert claimed.attempts == 1
+
+        t1 = t0 + timedelta(seconds=10)
+        retried = retry_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-retry",
+            error_message="Gitleaks timed out after 60s",
+            error_code="TIMEOUT",
+            now=t1,
+        )
+
+        assert retried.id == job.id
+        assert retried.status == "queued"
+        # Run_after is in the future
+        assert retried.run_after > t1
+        assert retried.locked_by is None
+        assert retried.locked_until is None
+        # Payload must be preserved for retry
+        assert retried.payload is not None
+        assert retried.last_error == "Gitleaks timed out after 60s"
+
+        # Scan is queued again, duration/finished_at cleared
+        assert retried.scan.status == "queued"
+        assert retried.scan.error_code == "TIMEOUT"
+        assert retried.scan.error_message == "Gitleaks timed out after 60s"
+        assert retried.scan.finished_at is None
+        assert retried.scan.duration_ms is None
+
+    def test_retry_job_custom_delay(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Custom retry_delay_sec sets run_after to exactly now + retry_delay_sec."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w", now=t0)
+
+        retried = retry_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w",
+            retry_delay_sec=120,
+            now=t0,
+        )
+
+        assert retried.status == "queued"
+        expected_run_after = t0 + timedelta(seconds=120)
+        run_after_utc = (
+            retried.run_after
+            if retried.run_after.tzinfo is not None
+            else retried.run_after.replace(tzinfo=UTC)
+        )
+        assert run_after_utc == expected_run_after
+
+    def test_retry_job_large_attempt_count_capped_and_does_not_overflow(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Very high attempt count does not raise OverflowError and backoff is capped at 3600s."""
+        _, job = _create_test_scan_and_job(
+            db_session,
+            sample_project,
+            attempts=99,
+            max_attempts=101,
+        )
+        t0 = utc_now()
+        claimed = claim_next_job(db_session, worker_id="w-large-attempts", now=t0)
+        assert claimed is not None
+        assert claimed.attempts == 100
+
+        retried = retry_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-large-attempts",
+            error_message="High retry attempt failure",
+            now=t0,
+        )
+        assert retried.status == "queued"
+        expected_run_after = t0 + timedelta(seconds=3600)
+        run_after_utc = (
+            retried.run_after
+            if retried.run_after.tzinfo is not None
+            else retried.run_after.replace(tzinfo=UTC)
+        )
+        assert run_after_utc == expected_run_after
+
+    @pytest.mark.parametrize("invalid_delay", [0, -1, -60, True, False, 3.5, "60"])
+    def test_retry_job_invalid_delay_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+        invalid_delay: Any,
+    ) -> None:
+        """retry_delay_sec must be a positive integer; other types/values raise ValueError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        claim_next_job(db_session, worker_id="w")
+
+        with pytest.raises(ValueError, match="retry_delay_sec must be a positive integer"):
+            retry_job(db_session, job_id=job.id, worker_id="w", retry_delay_sec=invalid_delay)
+
+    def test_requeued_job_can_be_reclaimed_after_run_after(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """A requeued job is eligible to be claimed only after run_after has elapsed."""
+        t0 = utc_now()
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w1", now=t0)
+
+        # Requeue with 30s delay -> run_after is t0 + 30s
+        retry_job(db_session, job_id=job.id, worker_id="w1", retry_delay_sec=30, now=t0)
+
+        # 1. At t0 + 10s: not eligible yet
+        too_early = claim_next_job(db_session, worker_id="w2", now=t0 + timedelta(seconds=10))
+        assert too_early is None
+
+        # 2. At t0 + 31s: eligible and claimed!
+        claimed_again = claim_next_job(db_session, worker_id="w2", now=t0 + timedelta(seconds=31))
+        assert claimed_again is not None
+        assert claimed_again.id == job.id
+        assert claimed_again.status == "running"
+        assert claimed_again.attempts == 2
+
+    def test_retry_job_exhausted_max_attempts_transitions_to_terminal_failed(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When attempts >= max_attempts, retryable failure transitions to terminal 'failed'."""
+        # Create job with attempts=2, max_attempts=3
+        _, job = _create_test_scan_and_job(
+            db_session,
+            sample_project,
+            attempts=2,
+            max_attempts=3,
+        )
+        t0 = utc_now()
+        # Claiming increments attempts to 3 (attempts == max_attempts)
+        claimed = claim_next_job(db_session, worker_id="w-final", now=t0)
+        assert claimed is not None
+        assert claimed.attempts == 3
+
+        # Calling retry_job when attempts exhausted
+        exhausted = retry_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-final",
+            error_message="Repeated parser failure",
+            error_code="PARSER_ERR",
+            now=t0 + timedelta(seconds=5),
+        )
+
+        assert exhausted.id == job.id
+        # Must transition to terminal failed, not queued
+        assert exhausted.status == "failed"
+        assert exhausted.locked_by is None
+        assert exhausted.locked_until is None
+        assert exhausted.payload is None  # Nulled on terminal failure
+
+        # Scan is marked failed
+        assert exhausted.scan.status == "failed"
+        assert exhausted.scan.error_code == "PARSER_ERR"
+        assert exhausted.scan.error_message == "Repeated parser failure"
+        assert exhausted.scan.finished_at is not None
+        assert exhausted.scan.duration_ms is not None
+
+
+class TestJobTransitionConcurrency:
+    """Concurrency verification for job completion and failure transitions."""
+
+    def test_concurrent_completion_single_winner(self) -> None:
+        """When 2 workers race to complete the same running job, exactly 1 succeeds and 1 fails."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = os.path.join(temp_dir, "concurrency_complete.db")
+            engine = create_engine(f"sqlite:///{db_file}", connect_args={"timeout": 30})
+            try:
+                Base.metadata.create_all(engine)
+                factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+
+                with factory() as init_session:
+                    user = User(id=uuid.uuid4(), github_user_id=55555, github_login="c-user")
+                    init_session.add(user)
+                    project = Project(
+                        id=uuid.uuid4(),
+                        owner_user_id=user.id,
+                        kind="manual",
+                        name="C-Proj",
+                        status="active",
+                    )
+                    init_session.add(project)
+                    scan = Scan(
+                        id=uuid.uuid4(),
+                        project_id=project.id,
+                        trigger="manual",
+                        trigger_key="ckey",
+                        status="queued",
+                    )
+                    job = Job(id=uuid.uuid4(), scan=scan, status="queued")
+                    init_session.add_all([scan, job])
+                    init_session.commit()
+
+                    # Claim job with worker-c
+                    claimed = claim_next_job(init_session, worker_id="worker-c", auto_commit=True)
+                    assert claimed is not None
+                    job_id = claimed.id
+
+                results: list[str] = []
+
+                def worker_complete() -> None:
+                    with factory() as s:
+                        try:
+                            complete_job(s, job_id=job_id, worker_id="worker-c", auto_commit=True)
+                            results.append("success")
+                        except JobInvalidStateError:
+                            results.append("conflict")
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(worker_complete) for _ in range(2)]
+                    concurrent.futures.wait(futures)
+
+                assert results.count("success") == 1
+                assert results.count("conflict") == 1
+            finally:
+                engine.dispose()
+
+    def test_concurrent_fail_and_complete_race(self) -> None:
+        """When complete_job and fail_job race for the same job, exactly 1 succeeds and 1 receives conflict."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = os.path.join(temp_dir, "concurrency_race.db")
+            engine = create_engine(f"sqlite:///{db_file}", connect_args={"timeout": 30})
+            try:
+                Base.metadata.create_all(engine)
+                factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+
+                with factory() as init_session:
+                    user = User(id=uuid.uuid4(), github_user_id=66666, github_login="race-user")
+                    init_session.add(user)
+                    project = Project(
+                        id=uuid.uuid4(),
+                        owner_user_id=user.id,
+                        kind="manual",
+                        name="Race-Proj",
+                        status="active",
+                    )
+                    init_session.add(project)
+                    scan = Scan(
+                        id=uuid.uuid4(),
+                        project_id=project.id,
+                        trigger="manual",
+                        trigger_key="race-key",
+                        status="queued",
+                    )
+                    job = Job(id=uuid.uuid4(), scan=scan, status="queued")
+                    init_session.add_all([scan, job])
+                    init_session.commit()
+
+                    claimed = claim_next_job(
+                        init_session, worker_id="worker-race", auto_commit=True
+                    )
+                    assert claimed is not None
+                    job_id = claimed.id
+
+                results: list[str] = []
+
+                def do_complete() -> None:
+                    with factory() as s:
+                        try:
+                            complete_job(
+                                s, job_id=job_id, worker_id="worker-race", auto_commit=True
+                            )
+                            results.append("complete_success")
+                        except JobInvalidStateError:
+                            results.append("complete_conflict")
+
+                def do_fail() -> None:
+                    with factory() as s:
+                        try:
+                            fail_job(s, job_id=job_id, worker_id="worker-race", auto_commit=True)
+                            results.append("fail_success")
+                        except JobInvalidStateError:
+                            results.append("fail_conflict")
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    f1 = executor.submit(do_complete)
+                    f2 = executor.submit(do_fail)
+                    concurrent.futures.wait([f1, f2])
+
+                # Exactly one winner
+                winners = [r for r in results if r in ("complete_success", "fail_success")]
+                conflicts = [r for r in results if r in ("complete_conflict", "fail_conflict")]
+                assert len(winners) == 1
+                assert len(conflicts) == 1
+            finally:
+                engine.dispose()
+
+
+class TestJobSanitization:
+    """Unit tests for failure message sanitization."""
+
+    def test_sanitization_redacts_database_urls(self) -> None:
+        """Database connection strings across postgresql, mysql, and sqlite are redacted."""
+        msg = "Error connecting to postgresql+psycopg://sentinel_user:secret123@localhost:5432/sentinel_db."
+        sanitized = sanitize_failure_message(msg)
+        assert "secret123" not in sanitized
+        assert "postgresql+psycopg://" not in sanitized
+        assert "[REDACTED_DATABASE_URL]" in sanitized
+
+    def test_sanitization_redacts_secrets(self) -> None:
+        """Personal access tokens and key-value secrets are redacted."""
+        msg = (
+            "Found token ghp_1234567890abcdef1234567890abcdef123456 in file. "
+            "Also password='super_secret_val' was parsed."
+        )
+        sanitized = sanitize_failure_message(msg)
+        assert "ghp_1234567890abcdef1234567890abcdef123456" not in sanitized
+        assert "super_secret_val" not in sanitized
+        assert "[REDACTED_SECRET]" in sanitized
+        assert "password=[REDACTED]" in sanitized
+
+    def test_sanitization_strips_stacktraces_and_limits_length(self) -> None:
+        """Raw driver stack traces are stripped, internal frames/code lines removed, and length limited."""
+        dirty = (
+            "Scanner aborted. \n"
+            "Traceback (most recent call last):\n"
+            "  File 'worker.py', line 50\n"
+            "    res = db.execute(query)\n"
+            "sqlalchemy.exc.OperationalError: server dropped connection\n" + ("A" * 600)
+        )
+        sanitized = sanitize_failure_message(dirty, max_length=100)
+        assert "Traceback" not in sanitized
+        assert "File " not in sanitized
+        assert "worker.py" not in sanitized
+        assert "db.execute" not in sanitized
+        assert "sqlalchemy.exc" not in sanitized
+        assert "server dropped connection" not in sanitized
+        assert "Scanner aborted." in sanitized
+        assert len(sanitized) <= 100
+
+    def test_sanitization_long_prefix_before_traceback_truncated(self) -> None:
+        """A long prefix before a traceback is sanitized and truncated with ellipsis."""
+        dirty = ("Detailed prefix error info: " + ("X" * 150)) + (
+            "\nTraceback (most recent call last):\n"
+            "  File '/opt/sentinel/backend/worker.py', line 99\n"
+            "    raise ValueError('secret_leak')\n"
+            "ValueError: secret_leak"
+        )
+        sanitized = sanitize_failure_message(dirty, max_length=50)
+        assert len(sanitized) <= 50
+        assert sanitized.endswith("...")
+        assert "Traceback" not in sanitized
+        assert "File " not in sanitized
+        assert "worker.py" not in sanitized
+        assert "secret_leak" not in sanitized
+        assert "Detailed prefix error info:" in sanitized
+
+    def test_sanitization_traceback_at_start_fallback_message(self) -> None:
+        """Traceback at message start without prefix falls back to generic failure message."""
+        dirty = (
+            "Traceback (most recent call last):\n"
+            "  File '/app/backend/worker.py', line 123, in run_scanner\n"
+            "    execute_scan()\n"
+            "ZeroDivisionError: division by zero"
+        )
+        sanitized = sanitize_failure_message(dirty)
+        assert sanitized == "Job execution failed"
+        assert "File " not in sanitized
+        assert "worker.py" not in sanitized
+        assert "ZeroDivisionError" not in sanitized
+        assert "Traceback" not in sanitized
+
+    @pytest.mark.parametrize(
+        ("raw_message", "expected_redaction", "secret_token"),
+        [
+            (
+                "Anthropic scanner error with sk-ant-api03-abcdef1234567890abcdef123456 in log",
+                "Anthropic scanner error with [REDACTED_SECRET] in log",
+                "sk-ant-api03-abcdef1234567890abcdef123456",
+            ),
+            (
+                "OpenAI scanner error with sk-abcdef1234567890abcdef123456 in response",
+                "OpenAI scanner error with [REDACTED_SECRET] in response",
+                "sk-abcdef1234567890abcdef123456",
+            ),
+            (
+                "OpenAI project key sk-proj-abcdef1234567890abcdef123456 failed",
+                "OpenAI project key [REDACTED_SECRET] failed",
+                "sk-proj-abcdef1234567890abcdef123456",
+            ),
+        ],
+    )
+    def test_sanitization_redacts_openai_and_anthropic_synthetic_tokens(
+        self,
+        raw_message: str,
+        expected_redaction: str,
+        secret_token: str,
+    ) -> None:
+        """Synthetic OpenAI and Anthropic API tokens are redacted and not present in output."""
+        sanitized = sanitize_failure_message(raw_message)
+        assert sanitized == expected_redaction
+        assert secret_token not in sanitized
+
+    @pytest.mark.parametrize(
+        "benign_text",
+        [
+            "Task failed due to missing input file: path/to/file.py",
+            "Skill-based task routing completed successfully",
+            "sk-short is not a secret token",
+            "Ordinary message with numbers 12345 and words",
+        ],
+    )
+    def test_sanitization_preserves_ordinary_non_secret_text(self, benign_text: str) -> None:
+        """Ordinary non-secret text is preserved without false-positive redaction."""
+        assert sanitize_failure_message(benign_text) == benign_text
+
+    def test_job_service_exception_hierarchy(self) -> None:
+        """Verify job service exception hierarchy and inheritance."""
+        assert issubclass(JobClaimError, JobServiceError)
+        assert issubclass(JobNotFoundError, JobServiceError)
+        assert issubclass(JobInvalidStateError, JobServiceError)
+        assert issubclass(JobOwnershipError, JobServiceError)
+        assert issubclass(JobTransitionError, JobServiceError)
+        assert issubclass(JobCompleteError, JobTransitionError)
+        assert issubclass(JobFailureError, JobTransitionError)

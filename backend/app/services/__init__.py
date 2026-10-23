@@ -2,8 +2,18 @@
 
 from app.services.job_service import (
     JobClaimError,
+    JobCompleteError,
+    JobFailureError,
+    JobInvalidStateError,
+    JobNotFoundError,
+    JobOwnershipError,
     JobServiceError,
+    JobTransitionError,
     claim_next_job,
+    complete_job,
+    fail_job,
+    retry_job,
+    sanitize_failure_message,
 )
 from app.services.scan_service import (
     ProjectNotFoundError,
@@ -23,7 +33,13 @@ from app.services.scan_service import (
 
 __all__ = [
     "JobClaimError",
+    "JobCompleteError",
+    "JobFailureError",
+    "JobInvalidStateError",
+    "JobNotFoundError",
+    "JobOwnershipError",
     "JobServiceError",
+    "JobTransitionError",
     "ProjectNotFoundError",
     "ScanConflictError",
     "ScanNotFoundError",
@@ -32,10 +48,14 @@ __all__ = [
     "ScanValidationError",
     "UserNotFoundError",
     "claim_next_job",
+    "complete_job",
     "create_manual_scan",
     "create_scan_and_job",
+    "fail_job",
     "get_scan",
     "is_extension_supported",
     "is_minified_or_generated",
+    "retry_job",
+    "sanitize_failure_message",
     "validate_manual_scan_files",
 ]
