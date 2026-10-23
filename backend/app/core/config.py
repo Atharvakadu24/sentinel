@@ -39,7 +39,9 @@ class Settings(BaseSettings):
         default_factory=lambda: SecretStr("replace-with-a-random-32-byte-hex-string-for-dev-only")
     )
     SESSION_SECRET: SecretStr = Field(
-        default_factory=lambda: SecretStr("replace-with-a-random-32-byte-hex-string-for-session-cookies")
+        default_factory=lambda: SecretStr(
+            "replace-with-a-random-32-byte-hex-string-for-session-cookies"
+        )
     )
 
     # Database (PostgreSQL 16)
@@ -52,9 +54,7 @@ class Settings(BaseSettings):
 
     # Security & Fingerprint Key (Server-side HMAC anchor key)
     FINGERPRINT_KEY: SecretStr = Field(
-        default_factory=lambda: SecretStr(
-            "replace-with-a-secure-random-hex-key-for-fingerprinting"
-        )
+        default_factory=lambda: SecretStr("replace-with-a-secure-random-hex-key-for-fingerprinting")
     )
 
     # GitHub App Integration
@@ -94,6 +94,11 @@ class Settings(BaseSettings):
 
     # Observability
     SENTRY_DSN: str | None = None
+
+    # Development-only opt-in guards (Threat T4 / Tenant Isolation)
+    # Scan creation requires authenticated sessions; unauthenticated access fails closed
+    # by default and can only be enabled explicitly in non-production environments.
+    ENABLE_DEV_UNAUTHENTICATED_SCANS: bool = False
 
     @field_validator("FINGERPRINT_KEY")
     @classmethod
@@ -142,6 +147,12 @@ class Settings(BaseSettings):
             # 3. Production secret hygiene (minimum length, non-placeholder, character diversity)
             _validate_production_secret("SECRET_KEY", self.SECRET_KEY)
             _validate_production_secret("SESSION_SECRET", self.SESSION_SECRET)
+
+            # 4. Fail-closed: unauthenticated scan submissions MUST NOT be enabled in production
+            if self.ENABLE_DEV_UNAUTHENTICATED_SCANS:
+                raise ValueError(
+                    "Production startup failure: ENABLE_DEV_UNAUTHENTICATED_SCANS must not be true in production"
+                )
 
         return self
 

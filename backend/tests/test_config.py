@@ -46,9 +46,7 @@ class TestSettings:
     def test_runtime_validation_rejects_unconfigured_placeholder(self) -> None:
         """Default placeholder is accepted at startup in dev, but fails strict runtime check."""
         settings = Settings(
-            FINGERPRINT_KEY=SecretStr(
-                "replace-with-a-secure-random-hex-key-for-fingerprinting"
-            )
+            FINGERPRINT_KEY=SecretStr("replace-with-a-secure-random-hex-key-for-fingerprinting")
         )
         with pytest.raises(ValueError, match="template placeholder"):
             settings.validate_runtime_fingerprint_key()
@@ -102,7 +100,9 @@ class TestSettings:
 
     def test_production_fails_if_secret_key_contains_known_placeholder(self) -> None:
         valid_key = SecretStr("0123456789abcdef0123456789abcdef")
-        with pytest.raises(ValidationError, match="contains known placeholder pattern 'replace-with'"):
+        with pytest.raises(
+            ValidationError, match="contains known placeholder pattern 'replace-with'"
+        ):
             Settings(
                 APP_ENV="production",
                 AI_DEBUG_LOG=False,
@@ -113,7 +113,9 @@ class TestSettings:
 
     def test_production_fails_if_secret_key_exhibits_trivial_repetition(self) -> None:
         valid_key = SecretStr("0123456789abcdef0123456789abcdef")
-        with pytest.raises(ValidationError, match="trivial repetition or insufficient character diversity"):
+        with pytest.raises(
+            ValidationError, match="trivial repetition or insufficient character diversity"
+        ):
             Settings(
                 APP_ENV="production",
                 AI_DEBUG_LOG=False,
@@ -143,3 +145,39 @@ class TestSettings:
         )
         assert settings.APP_ENV == "production"
         assert settings.validate_runtime_fingerprint_key() == b"fedcba9876543210fedcba9876543210"
+        assert settings.ENABLE_DEV_UNAUTHENTICATED_SCANS is False
+
+    def test_default_enable_dev_unauthenticated_scans_is_false(self) -> None:
+        settings = Settings()
+        assert settings.ENABLE_DEV_UNAUTHENTICATED_SCANS is False
+
+    def test_production_fails_if_enable_dev_unauthenticated_scans_true(self) -> None:
+        valid_key = SecretStr("0123456789abcdef0123456789abcdef")
+        with pytest.raises(
+            ValidationError,
+            match="ENABLE_DEV_UNAUTHENTICATED_SCANS must not be true in production",
+        ):
+            Settings(
+                APP_ENV="production",
+                AI_DEBUG_LOG=False,
+                ENABLE_DEV_UNAUTHENTICATED_SCANS=True,
+                SECRET_KEY=valid_key,
+                SESSION_SECRET=valid_key,
+                FINGERPRINT_KEY=valid_key,
+            )
+
+    def test_invalid_app_env_rejected(self) -> None:
+        """Non-standard or mis-cased environment names are rejected by Literal validation."""
+        for invalid_env in ["staging", "PRODUCTION", "prod", "DEV", ""]:
+            with pytest.raises(ValidationError):
+                Settings(APP_ENV=invalid_env)
+
+    def test_enable_dev_unauthenticated_scans_boolean_parsing(self) -> None:
+        """Verify strict boolean parsing for dev unauthenticated scans."""
+        assert (
+            Settings(ENABLE_DEV_UNAUTHENTICATED_SCANS=False).ENABLE_DEV_UNAUTHENTICATED_SCANS
+            is False
+        )
+        assert (
+            Settings(ENABLE_DEV_UNAUTHENTICATED_SCANS=True).ENABLE_DEV_UNAUTHENTICATED_SCANS is True
+        )
