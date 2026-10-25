@@ -22,6 +22,7 @@ import uuid
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine, event, select
@@ -31,7 +32,12 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base, utc_now
 from app.db.models import Job, Project, Scan, User
-from app.services.job_service import JobOwnershipError
+from app.services.job_service import (
+    JobInvalidStateError,
+    JobOwnershipError,
+    claim_next_job,
+    reap_expired_jobs,
+)
 from app.services.scan_service import MAX_FILE_BYTES, MAX_FILES_COUNT, MAX_TOTAL_BYTES
 from app.worker.payload import PayloadValidationError, validate_scan_payload
 from app.worker.runner import JobWorker
@@ -920,3 +926,153 @@ class TestWorkerLifecycleAndShutdown:
         worker.stop()
         worker_thread.join(timeout=2.0)
         assert not worker_thread.is_alive()
+
+
+class TestWorkerReaperIntegration:
+    """Integration tests for periodic and explicit reaper execution in JobWorker."""
+
+    def test_worker_reap_expired_jobs_explicit(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Worker can explicitly sweep for and recover expired jobs in a dedicated session."""
+        t0 = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+        scan, job = _create_job_for_test(db_session, sample_project, run_after=t0)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-reaper",
+            lease_duration_sec=30,
+        )
+        # Claim job under a crashed worker
+        claimed = claim_next_job(db_session, worker_id="w-crashed", lease_duration_sec=30, now=t0)
+        assert claimed is not None
+
+        # Lease expires at t0 + 30s; worker reaps at t0 + 35s
+        t_reap = t0 + timedelta(seconds=35)
+        reaped = worker.reap_expired_jobs(now=t_reap)
+
+        assert len(reaped) == 1
+        assert reaped[0].id == job.id
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status == "queued"
+        assert job.locked_by is None
+        assert scan.status == "queued"
+        assert scan.error_code == "LEASE_EXPIRED"
+
+    def test_worker_run_once_with_reap_true_recovers_job(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """run_once(reap=True) reaps expired jobs before claiming work."""
+        t0 = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+        scan, job = _create_job_for_test(db_session, sample_project, run_after=t0)
+
+        claimed = claim_next_job(
+            db_session, worker_id="w-stale-prev", lease_duration_sec=30, now=t0
+        )
+        assert claimed is not None
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-new",
+            lease_duration_sec=60,
+        )
+
+        t_now = t0 + timedelta(seconds=45)
+        worker.run_once(now=t_now, reap=True)
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        # The job was reaped to queued
+        assert job.status == "queued"
+        assert job.locked_by is None
+        assert scan.status == "queued"
+        assert scan.error_code == "LEASE_EXPIRED"
+
+    def test_worker_polling_loop_triggers_periodic_reaping(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """JobWorker.run() triggers reaping during polling loop execution."""
+        t0 = utc_now() - timedelta(seconds=100)
+        scan, job = _create_job_for_test(db_session, sample_project, run_after=t0)
+
+        # Job claimed in the past whose lease is well expired
+        claimed = claim_next_job(db_session, worker_id="w-abandoned", lease_duration_sec=30, now=t0)
+        assert claimed is not None
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-loop-reaper",
+            poll_interval_sec=0.01,
+            reaper_interval_sec=0.0,  # Forces reaping on loop cycle
+        )
+
+        # Run worker for 1 iteration
+        worker.run(max_iterations=1)
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status == "queued"
+        assert job.locked_by is None
+        assert scan.status == "queued"
+        assert scan.error_code == "LEASE_EXPIRED"
+
+    def test_worker_reaper_catches_and_logs_exception_safely(
+        self,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """Reaper database errors do not crash or raise out of worker.reap_expired_jobs."""
+        worker = JobWorker(session_factory=session_factory, worker_id="w-safe-reap")
+
+        with patch(
+            "app.worker.runner.reap_expired_jobs", side_effect=RuntimeError("Simulated DB error")
+        ):
+            result = worker.reap_expired_jobs()
+            assert result == []
+
+    def test_stale_worker_process_job_fails_gracefully_when_reaped_mid_flight(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When a job is reaped while scanner is running, worker's completion is rejected and logs warning."""
+        scan, job = _create_job_for_test(db_session, sample_project)
+
+        def slow_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            # During scan execution, reaper sweeps and requeues the job
+            with session_factory() as s:
+                reap_expired_jobs(s, retry_delay_sec=10, now=utc_now() + timedelta(seconds=100))
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-slow-runner",
+            lease_duration_sec=10,
+            scanner=CallableScannerEngine(slow_scanner),
+        )
+
+        t0 = utc_now()
+        # Worker claims job
+        claim_next_job(db_session, worker_id="w-slow-runner", lease_duration_sec=10, now=t0)
+
+        # Worker processes job; mid-flight scanner triggers reap
+        # When phase 3 tries complete_job, it fails because job was reaped to 'queued'
+        with pytest.raises(JobInvalidStateError, match="expected 'running'"):
+            worker.process_job(job_id=job.id, now=t0, completion_now=t0 + timedelta(seconds=20))
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        # Job must NOT be marked succeeded; remains queued from reaper
+        assert job.status == "queued"
+        assert scan.status == "queued"

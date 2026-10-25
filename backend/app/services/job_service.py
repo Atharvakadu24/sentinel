@@ -11,7 +11,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -71,6 +71,10 @@ class JobCompleteError(JobTransitionError):
 
 class JobFailureError(JobTransitionError):
     """Raised when an error occurs during job failure recording."""
+
+
+class JobReapError(JobTransitionError):
+    """Raised when an error occurs during expired job reaping."""
 
 
 def _normalize_datetime(dt: datetime | None) -> datetime | None:
@@ -598,3 +602,157 @@ def retry_job(
         now=now,
         auto_commit=auto_commit,
     )
+
+
+def reap_expired_jobs(
+    session: Session,
+    *,
+    batch_limit: int = 10,
+    retry_delay_sec: int | None = None,
+    now: datetime | None = None,
+    auto_commit: bool = True,
+) -> list[Job]:
+    """Recover and reconcile jobs left in 'running' status with expired leases.
+
+    Implements Threat Mitigation T13 (Worker concurrency and leases) and Blueprint
+    Section 7/8.1 queue resilience.
+
+    A job is considered expired if its status is 'running' and either its claim lease
+    has lapsed (locked_until < current_time) or locked_until is NULL. The lease boundary
+    is strictly inclusive: when locked_until == current_time, the worker's lease remains
+    valid and the job will not be reaped.
+
+    For expired jobs:
+    1. If attempts < max_attempts:
+       Requeues the job with bounded exponential backoff (or explicit retry_delay_sec),
+       clears lease ownership (locked_by=None, locked_until=None), updates run_after,
+       records sanitized last_error, resets associated scan state to 'queued' with
+       error_code='LEASE_EXPIRED', and preserves the job payload for subsequent execution.
+    2. If attempts >= max_attempts:
+       Transitions the job to terminal failure ('failed'), clears lease ownership,
+       erases sensitive payload (payload=None) per Threat Mitigation T3, marks the
+       associated scan 'failed' with error_code='LEASE_EXPIRED', and calculates
+       non-negative duration_ms.
+    3. Attempts are NEVER incremented during reaping: claim_next_job already increments
+       the attempt counter at claim time.
+
+    Uses `SELECT ... FOR UPDATE SKIP LOCKED` where supported by the database dialect
+    (PostgreSQL) to ensure multiple concurrent reapers never process the same expired
+    job or block each other. All Job and Scan mutations are executed within the same
+    transaction boundary.
+
+    Args:
+        session: Active SQLAlchemy database session.
+        batch_limit: Maximum number of expired jobs to recover in one sweep.
+            Must be a positive integer. Defaults to 10.
+        retry_delay_sec: Optional seconds delay before requeued job is eligible
+            for claiming. Must be a positive integer if provided. Defaults to
+            exponential backoff matching fail_job conventions.
+        now: Reference timestamp for lease expiration check and state transitions.
+            Defaults to utc_now().
+        auto_commit: If True (default), commits the transaction immediately.
+            If False, flushes changes to the session.
+
+    Returns:
+        List of Job instances that were successfully reaped in this sweep.
+
+    Raises:
+        ValueError: If batch_limit or retry_delay_sec is invalid.
+        JobReapError: If a database error occurs during reaping.
+    """
+    if not isinstance(batch_limit, int) or isinstance(batch_limit, bool) or batch_limit <= 0:
+        raise ValueError("batch_limit must be a positive integer")
+
+    if retry_delay_sec is not None and (
+        not isinstance(retry_delay_sec, int)
+        or isinstance(retry_delay_sec, bool)
+        or retry_delay_sec <= 0
+    ):
+        raise ValueError("retry_delay_sec must be a positive integer")
+
+    if now is None:
+        current_time = utc_now()
+    elif now.tzinfo is None:
+        current_time = now.replace(tzinfo=UTC)
+    else:
+        current_time = now
+
+    stmt = (
+        select(Job)
+        .where(
+            Job.status == "running",
+            or_(
+                Job.locked_until < current_time,
+                Job.locked_until.is_(None),
+            ),
+        )
+        .order_by(Job.locked_until.asc().nulls_first(), Job.id.asc())
+        .limit(batch_limit)
+        .with_for_update(skip_locked=True)
+    )
+
+    try:
+        expired_jobs = list(session.scalars(stmt).all())
+        if not expired_jobs:
+            return []
+
+        for job in expired_jobs:
+            old_worker = job.locked_by or "unknown"
+            sanitized_msg = sanitize_failure_message(
+                f"Job lease expired while running on worker '{old_worker}'"
+            )
+
+            # Determine retry eligibility based on attempts recorded at claim time
+            if job.attempts < job.max_attempts:
+                # Requeue with backoff
+                if retry_delay_sec is not None:
+                    delay = retry_delay_sec
+                else:
+                    attempt_exp = min(max(0, job.attempts - 1), 12)
+                    delay = min(3600, 10 * (2**attempt_exp))
+
+                scheduled_run_after = current_time + timedelta(seconds=delay)
+                job.status = "queued"
+                job.run_after = scheduled_run_after
+                job.locked_by = None
+                job.locked_until = None
+                job.last_error = sanitized_msg
+                # Payload is preserved for subsequent attempt
+
+                if job.scan is not None:
+                    job.scan.status = "queued"
+                    job.scan.error_code = "LEASE_EXPIRED"
+                    job.scan.error_message = sanitized_msg
+                    job.scan.finished_at = None
+                    job.scan.duration_ms = None
+            else:
+                # Terminal failure
+                job.status = "failed"
+                job.locked_by = None
+                job.locked_until = None
+                job.last_error = sanitized_msg
+                job.payload = None  # Sensitive payload erased on terminal failure
+
+                if job.scan is not None:
+                    job.scan.status = "failed"
+                    job.scan.error_code = "LEASE_EXPIRED"
+                    job.scan.error_message = sanitized_msg
+                    job.scan.finished_at = current_time
+                    ref_start = job.scan.started_at or job.scan.queued_at or current_time
+                    ref_start_utc = _normalize_datetime(ref_start)
+                    if ref_start_utc is not None:
+                        duration = (current_time - ref_start_utc).total_seconds() * 1000
+                        job.scan.duration_ms = max(0, int(duration))
+
+        if auto_commit:
+            session.commit()
+        else:
+            session.flush()
+
+        return expired_jobs
+    except SQLAlchemyError as exc:
+        session.rollback()
+        raise JobReapError("Database error while reaping expired jobs") from exc
+    except Exception as exc:
+        session.rollback()
+        raise JobReapError("Unexpected error while reaping expired jobs") from exc

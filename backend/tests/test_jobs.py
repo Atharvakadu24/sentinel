@@ -23,7 +23,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, or_, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -38,11 +38,14 @@ from app.services.job_service import (
     JobInvalidStateError,
     JobNotFoundError,
     JobOwnershipError,
+    JobReapError,
     JobServiceError,
     JobTransitionError,
+    _normalize_datetime,
     claim_next_job,
     complete_job,
     fail_job,
+    reap_expired_jobs,
     retry_job,
     sanitize_failure_message,
 )
@@ -1829,3 +1832,431 @@ class TestJobSanitization:
         assert issubclass(JobTransitionError, JobServiceError)
         assert issubclass(JobCompleteError, JobTransitionError)
         assert issubclass(JobFailureError, JobTransitionError)
+        assert issubclass(JobReapError, JobTransitionError)
+
+
+class TestJobReaper:
+    """Unit and boundary tests for expired job lease recovery (reap_expired_jobs)."""
+
+    def test_reap_running_job_expired_lease_requeues_with_backoff(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Expired running job with remaining attempts is requeued with backoff and payload preserved."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        scan, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+
+        # Claim with 60s lease -> attempts=1, locked_until=t0 + 60s
+        claimed = claim_next_job(
+            db_session, worker_id="worker-crash", lease_duration_sec=60, now=t0
+        )
+        assert claimed is not None
+        assert claimed.attempts == 1
+        assert claimed.status == "running"
+        assert claimed.locked_by == "worker-crash"
+        assert _normalize_datetime(claimed.locked_until) == t0 + timedelta(seconds=60)
+        assert claimed.scan.status == "running"
+        assert _normalize_datetime(claimed.scan.started_at) == t0
+        original_payload = claimed.payload
+
+        # 70s later (lease expired 10s ago)
+        t_reap = t0 + timedelta(seconds=70)
+        reaped = reap_expired_jobs(db_session, now=t_reap)
+
+        assert len(reaped) == 1
+        assert reaped[0].id == job.id
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+
+        # Job state verification
+        assert job.status == "queued"
+        assert job.locked_by is None
+        assert job.locked_until is None
+        assert job.attempts == 1  # Attempts NOT re-incremented
+        # Exponential backoff for attempt 1: 10s * 2^0 = 10s
+        assert _normalize_datetime(job.run_after) == t_reap + timedelta(seconds=10)
+        assert job.last_error is not None
+        assert "Job lease expired while running on worker 'worker-crash'" in job.last_error
+        assert job.payload == original_payload  # Payload preserved!
+
+        # Scan state verification
+        assert scan.status == "queued"
+        assert scan.error_code == "LEASE_EXPIRED"
+        assert scan.error_message == job.last_error
+        assert scan.finished_at is None
+        assert scan.duration_ms is None
+
+    def test_reap_running_job_custom_retry_delay(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Custom retry_delay_sec overrides default exponential backoff during requeue."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="worker-custom-delay", lease_duration_sec=60, now=t0)
+
+        t_reap = t0 + timedelta(seconds=75)
+        reaped = reap_expired_jobs(db_session, retry_delay_sec=120, now=t_reap)
+
+        assert len(reaped) == 1
+        db_session.refresh(job)
+        assert _normalize_datetime(job.run_after) == t_reap + timedelta(seconds=120)
+
+    def test_reap_running_job_max_attempts_exhausted_terminates_and_erases_payload(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Expired running job at max_attempts transitions to failed and erases payload."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        scan, job = _create_test_scan_and_job(
+            db_session,
+            sample_project,
+            run_after=t0,
+            attempts=2,
+            max_attempts=3,
+        )
+
+        # Claim third and final attempt -> attempts=3, max_attempts=3
+        claimed = claim_next_job(
+            db_session, worker_id="worker-exhausted", lease_duration_sec=60, now=t0
+        )
+        assert claimed is not None
+        assert claimed.attempts == 3
+        assert claimed.max_attempts == 3
+
+        t_reap = t0 + timedelta(seconds=80)
+        reaped = reap_expired_jobs(db_session, now=t_reap)
+
+        assert len(reaped) == 1
+        db_session.refresh(job)
+        db_session.refresh(scan)
+
+        # Job state verification
+        assert job.status == "failed"
+        assert job.locked_by is None
+        assert job.locked_until is None
+        assert job.attempts == 3  # Not incremented further
+        assert job.payload is None  # Sensitive payload erased!
+        assert job.last_error is not None
+        assert "Job lease expired while running on worker 'worker-exhausted'" in job.last_error
+
+        # Scan state verification
+        assert scan.status == "failed"
+        assert scan.error_code == "LEASE_EXPIRED"
+        assert scan.error_message == job.last_error
+        assert _normalize_datetime(scan.finished_at) == t_reap
+        assert scan.duration_ms == 80000  # (80s * 1000ms)
+
+    def test_reap_exact_lease_boundary_not_reaped(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When now == locked_until, the worker lease is still valid (inclusive boundary); reaper skips it."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-boundary", lease_duration_sec=60, now=t0)
+
+        # Exactly at expiry boundary
+        t_boundary = t0 + timedelta(seconds=60)
+        reaped = reap_expired_jobs(db_session, now=t_boundary)
+
+        assert len(reaped) == 0
+        db_session.refresh(job)
+        assert job.status == "running"
+        assert job.locked_by == "w-boundary"
+
+    def test_reap_microsecond_past_lease_boundary_is_reaped(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When now == locked_until + 1us, the lease is expired and the job is reaped."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-boundary-past", lease_duration_sec=60, now=t0)
+
+        t_past = t0 + timedelta(seconds=60, microseconds=1)
+        reaped = reap_expired_jobs(db_session, now=t_past)
+
+        assert len(reaped) == 1
+        db_session.refresh(job)
+        assert job.status == "queued"
+        assert job.locked_by is None
+
+    def test_reap_unexpired_running_jobs_ignored(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Running jobs whose lease has not expired are not touched by reaper."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-active", lease_duration_sec=120, now=t0)
+
+        # 30s into a 120s lease
+        t_active = t0 + timedelta(seconds=30)
+        reaped = reap_expired_jobs(db_session, now=t_active)
+
+        assert len(reaped) == 0
+        db_session.refresh(job)
+        assert job.status == "running"
+        assert job.locked_by == "w-active"
+
+    def test_reap_non_running_jobs_ignored(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Jobs in queued, succeeded, failed, or dead statuses are never reaped even with past locked_until."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        past_time = t0 - timedelta(seconds=100)
+
+        # Create jobs across non-running statuses with past locked_until
+        for status in ("queued", "succeeded", "failed", "dead"):
+            s = Scan(
+                project_id=sample_project.id,
+                trigger="manual",
+                trigger_key=f"non-running-{status}-{uuid.uuid4()}",
+                status=status if status != "dead" else "failed",
+            )
+            db_session.add(s)
+            db_session.flush()
+            j = Job(
+                scan_id=s.id,
+                status=status,
+                locked_by="old-worker",
+                locked_until=past_time,
+                payload={"files": []},
+            )
+            db_session.add(j)
+        db_session.commit()
+
+        reaped = reap_expired_jobs(db_session, now=t0)
+        assert len(reaped) == 0
+
+    def test_reap_running_job_with_null_locked_until_handled_safely(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Running job with NULL locked_until is safely treated as expired and reaped."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        s = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key=f"null-lock-{uuid.uuid4()}",
+            status="running",
+            started_at=t0,
+        )
+        db_session.add(s)
+        db_session.flush()
+        j = Job(
+            scan_id=s.id,
+            status="running",
+            locked_by="w-orphan",
+            locked_until=None,
+            attempts=1,
+            max_attempts=3,
+            payload={"files": [{"path": "orphan.py", "content": "pass"}]},
+        )
+        db_session.add(j)
+        db_session.commit()
+
+        reaped = reap_expired_jobs(db_session, now=t0)
+        assert len(reaped) == 1
+        assert reaped[0].id == j.id
+        db_session.refresh(j)
+        assert j.status == "queued"
+        assert j.locked_by is None
+
+    def test_reap_batch_limit_and_deterministic_ordering(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """batch_limit bounds the sweep size and orders oldest expired leases first."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        jobs: list[Job] = []
+
+        # Create 5 expired running jobs with staggered locked_until
+        for i in range(5):
+            s = Scan(
+                project_id=sample_project.id,
+                trigger="manual",
+                trigger_key=f"batch-test-{i}-{uuid.uuid4()}",
+                status="running",
+            )
+            db_session.add(s)
+            db_session.flush()
+            j = Job(
+                scan_id=s.id,
+                status="running",
+                locked_by=f"worker-{i}",
+                locked_until=t0 - timedelta(seconds=50 - (i * 10)),  # -50s, -40s, -30s, -20s, -10s
+                attempts=1,
+                max_attempts=3,
+                payload={"files": []},
+            )
+            db_session.add(j)
+            jobs.append(j)
+        db_session.commit()
+
+        # Batch 1: limit 2 -> oldest 2 reaped (i=0, i=1)
+        reaped_1 = reap_expired_jobs(db_session, batch_limit=2, now=t0)
+        assert len(reaped_1) == 2
+        assert reaped_1[0].id == jobs[0].id
+        assert reaped_1[1].id == jobs[1].id
+
+        # Batch 2: limit 2 -> next 2 reaped (i=2, i=3)
+        reaped_2 = reap_expired_jobs(db_session, batch_limit=2, now=t0)
+        assert len(reaped_2) == 2
+        assert reaped_2[0].id == jobs[2].id
+        assert reaped_2[1].id == jobs[3].id
+
+        # Batch 3: limit 2 -> last 1 reaped (i=4)
+        reaped_3 = reap_expired_jobs(db_session, batch_limit=2, now=t0)
+        assert len(reaped_3) == 1
+        assert reaped_3[0].id == jobs[4].id
+
+        # Subsequent call finds nothing
+        assert len(reap_expired_jobs(db_session, batch_limit=2, now=t0)) == 0
+
+    @pytest.mark.parametrize("invalid_limit", [0, -1, -10, "10", True, False, None])
+    def test_reap_invalid_batch_limit_rejected(
+        self,
+        db_session: Session,
+        invalid_limit: Any,
+    ) -> None:
+        """batch_limit must be a positive integer; non-int, bool, zero, and negative values raise ValueError."""
+        with pytest.raises(ValueError, match="batch_limit must be a positive integer"):
+            reap_expired_jobs(db_session, batch_limit=invalid_limit)
+
+    @pytest.mark.parametrize("invalid_delay", [0, -1, -60, "30", True, False])
+    def test_reap_invalid_retry_delay_rejected(
+        self,
+        db_session: Session,
+        invalid_delay: Any,
+    ) -> None:
+        """retry_delay_sec must be a positive integer if provided."""
+        with pytest.raises(ValueError, match="retry_delay_sec must be a positive integer"):
+            reap_expired_jobs(db_session, retry_delay_sec=invalid_delay)
+
+    def test_reap_auto_commit_false_flushes_without_committing(
+        self,
+        session_factory: sessionmaker[Session],
+        sample_project: Project,
+    ) -> None:
+        """With auto_commit=False, caller controls transaction commit/rollback."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        with session_factory() as s:
+            _, job = _create_test_scan_and_job(s, sample_project, run_after=t0)
+            claim_next_job(s, worker_id="w-rollback", lease_duration_sec=60, now=t0)
+            job_id = job.id
+
+        # Reaping with auto_commit=False, then rolling back
+        t_reap = t0 + timedelta(seconds=70)
+        with session_factory() as s:
+            reaped = reap_expired_jobs(s, auto_commit=False, now=t_reap)
+            assert len(reaped) == 1
+            assert reaped[0].status == "queued"
+            s.rollback()
+
+        # Job must still be running in the database
+        with session_factory() as s:
+            reloaded = s.get(Job, job_id)
+            assert reloaded is not None
+            assert reloaded.status == "running"
+            assert reloaded.locked_by == "w-rollback"
+
+    def test_reap_postgres_query_includes_for_update_skip_locked(self) -> None:
+        """PostgreSQL dialect renders FOR UPDATE SKIP LOCKED on reaper selection."""
+        now = utc_now()
+        stmt = (
+            select(Job)
+            .where(
+                Job.status == "running",
+                or_(
+                    Job.locked_until < now,
+                    Job.locked_until.is_(None),
+                ),
+            )
+            .order_by(Job.locked_until.asc().nulls_first(), Job.id.asc())
+            .limit(10)
+            .with_for_update(skip_locked=True)
+        )
+
+        pg_engine = create_engine("postgresql+psycopg://user:pass@localhost:5432/testdb")
+        compiled = str(stmt.compile(pg_engine))
+
+        assert "FOR UPDATE SKIP LOCKED" in compiled
+        assert "jobs.status =" in compiled
+        assert "jobs.locked_until <" in compiled
+
+    def test_stale_worker_complete_and_fail_rejected_after_job_reaped(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """A stale worker whose lease expired and was reaped cannot complete or fail the job."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        scan, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="worker-zombie", lease_duration_sec=60, now=t0)
+
+        # Reaper recovers job at t0 + 70s
+        t_reap = t0 + timedelta(seconds=70)
+        reaped = reap_expired_jobs(db_session, now=t_reap)
+        assert len(reaped) == 1
+        db_session.refresh(job)
+        assert job.status == "queued"
+
+        # Zombie worker wakes at t0 + 80s and tries complete_job
+        t_zombie = t0 + timedelta(seconds=80)
+        with pytest.raises(JobInvalidStateError, match="expected 'running'"):
+            complete_job(db_session, job_id=job.id, worker_id="worker-zombie", now=t_zombie)
+
+        # Zombie worker tries fail_job
+        with pytest.raises(JobInvalidStateError, match="expected 'running'"):
+            fail_job(db_session, job_id=job.id, worker_id="worker-zombie", now=t_zombie)
+
+        # Job and scan state remained intact from reaper
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status == "queued"
+        assert scan.status == "queued"
+
+    def test_stale_worker_cannot_complete_when_claimed_by_second_worker(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When a reaped job is re-claimed by worker 2, worker 1's late completion is rejected by ownership."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="worker-1", lease_duration_sec=60, now=t0)
+
+        # Reaper requeues with zero backoff for immediate re-claim test
+        t_reap = t0 + timedelta(seconds=70)
+        reap_expired_jobs(db_session, retry_delay_sec=1, now=t_reap)
+
+        # Worker 2 claims the requeued job at t0 + 72s
+        t_claim2 = t0 + timedelta(seconds=72)
+        claimed_w2 = claim_next_job(
+            db_session, worker_id="worker-2", lease_duration_sec=60, now=t_claim2
+        )
+        assert claimed_w2 is not None
+        assert claimed_w2.id == job.id
+        assert claimed_w2.locked_by == "worker-2"
+
+        # Worker 1 tries to complete the job at t0 + 75s
+        t_late = t0 + timedelta(seconds=75)
+        with pytest.raises(JobOwnershipError, match="locked by worker 'worker-2', not 'worker-1'"):
+            complete_job(db_session, job_id=job.id, worker_id="worker-1", now=t_late)
+
+        db_session.refresh(job)
+        assert job.status == "running"
+        assert job.locked_by == "worker-2"

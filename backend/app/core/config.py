@@ -91,6 +91,7 @@ class Settings(BaseSettings):
     WORKER_JOB_LEASE_SEC: int = 60
     WORKER_HEARTBEAT_SEC: int = 15
     WORKER_MAX_CONCURRENCY: int = 2
+    WORKER_REAPER_INTERVAL_SEC: float = 30.0
 
     # Observability
     SENTRY_DSN: str | None = None

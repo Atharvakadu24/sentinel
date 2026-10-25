@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,7 @@ from app.services.job_service import (
     claim_next_job,
     complete_job,
     fail_job,
+    reap_expired_jobs,
     sanitize_failure_message,
 )
 from app.worker.payload import PayloadValidationError, validate_scan_payload
@@ -49,6 +51,7 @@ class JobWorker:
         scanner: ScannerInterface | None = None,
         poll_interval_sec: float | None = None,
         lease_duration_sec: int | None = None,
+        reaper_interval_sec: float | None = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:12]}"
@@ -62,6 +65,12 @@ class JobWorker:
         self.lease_duration_sec = (
             lease_duration_sec if lease_duration_sec is not None else settings.WORKER_JOB_LEASE_SEC
         )
+        self.reaper_interval_sec = (
+            reaper_interval_sec
+            if reaper_interval_sec is not None
+            else settings.WORKER_REAPER_INTERVAL_SEC
+        )
+        self._last_reap_mono: float = 0.0
         self._stop_event = threading.Event()
 
     @property
@@ -73,21 +82,60 @@ class JobWorker:
         """Signal the worker loop to stop gracefully after completing in-flight work."""
         self._stop_event.set()
 
+    def reap_expired_jobs(
+        self,
+        *,
+        batch_limit: int = 10,
+        retry_delay_sec: int | None = None,
+        now: datetime | None = None,
+    ) -> list[Job]:
+        """Sweep and recover expired jobs in a dedicated short transaction.
+
+        Args:
+            batch_limit: Maximum number of expired jobs to recover in this sweep.
+            retry_delay_sec: Optional override for requeue backoff delay.
+            now: Reference timestamp for test injection.
+
+        Returns:
+            List of recovered Job instances.
+        """
+        try:
+            with session_scope(self.session_factory) as session:
+                return reap_expired_jobs(
+                    session,
+                    batch_limit=batch_limit,
+                    retry_delay_sec=retry_delay_sec,
+                    now=now,
+                    auto_commit=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - keep worker safe across reaper errors
+            logger.error(
+                "Worker %s error during expired job reaping: %s",
+                self.worker_id,
+                sanitize_failure_message(str(exc)),
+            )
+            return []
+
     def run_once(
         self,
         now: datetime | None = None,
         *,
         completion_now: datetime | None = None,
+        reap: bool = False,
     ) -> bool:
         """Poll and process at most one job from the queue.
 
         Args:
             now: Reference timestamp for testing claim eligibility and lease expiry.
             completion_now: Optional explicit timestamp for testing completion timing.
+            reap: If True, sweeps for and recovers expired jobs before claiming.
 
         Returns:
             True if an eligible job was claimed and processed, False if queue was empty.
         """
+        if reap:
+            self.reap_expired_jobs(now=now)
+
         claim_time = now or utc_now()
 
         # Step 1: Claim next eligible job in a dedicated short transaction
@@ -338,6 +386,21 @@ class JobWorker:
             if max_iterations is not None and iterations >= max_iterations:
                 break
             iterations += 1
+
+            # Check if it is time to sweep and reap expired jobs
+            current_mono = time.monotonic()
+            if (
+                self._last_reap_mono <= 0.0
+                or (current_mono - self._last_reap_mono) >= self.reaper_interval_sec
+            ):
+                reaped = self.reap_expired_jobs()
+                self._last_reap_mono = current_mono
+                if reaped:
+                    logger.info(
+                        "Worker %s reaped %d expired job(s)",
+                        self.worker_id,
+                        len(reaped),
+                    )
 
             try:
                 claimed = self.run_once()
