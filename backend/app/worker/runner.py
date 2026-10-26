@@ -10,10 +10,12 @@ import logging
 import signal
 import threading
 import time
+import types
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Self
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -22,11 +24,14 @@ from app.db.models import Job
 from app.db.session import dispose_engine, get_session_factory, session_scope
 from app.services.job_service import (
     JobInvalidStateError,
+    JobNotFoundError,
     JobOwnershipError,
+    _normalize_datetime,
     claim_next_job,
     complete_job,
     fail_job,
     reap_expired_jobs,
+    renew_job_lease,
     sanitize_failure_message,
 )
 from app.worker.payload import PayloadValidationError, validate_scan_payload
@@ -40,6 +45,268 @@ from app.worker.scanner import (
 logger = logging.getLogger("sentinel.worker")
 
 
+class JobHeartbeat:
+    """Scoped background lease renewal heartbeat for long-running worker jobs.
+
+    Runs a daemon background thread while the worker executes synchronous scanner analysis.
+    Periodically extends the job lease in dedicated, short-lived database transactions via
+    session_scope(), ensuring that active scans outlasting WORKER_JOB_LEASE_SEC are not reaped
+    by the expired-job lease reaper.
+
+    Implements:
+    - Dedicated short-lived session per renewal (zero DB connections held during scanning).
+    - Event-based wait using threading.Event.wait(interval_sec) without busy-waiting.
+    - Outcome classification:
+        * Confirmed lost ownership / invalid state (JobOwnershipError, JobInvalidStateError,
+          JobNotFoundError): marks lost_ownership=True, stops renewals, and instructs caller
+          to discard scan results.
+        * Transient errors (SQLAlchemyError, OperationalError, JobRenewalError): logs sanitized
+          warning and continues attempting renewal while lease remains valid.
+        * Worker shutdown: stops cleanly without bypassing worker shutdown semantics.
+    - Context manager interface for deterministic start, stop, and join coordination.
+    """
+
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        *,
+        job_id: uuid.UUID,
+        worker_id: str,
+        interval_sec: float,
+        lease_extension_sec: int,
+        initial_locked_until: datetime | None = None,
+        worker_stop_event: threading.Event | None = None,
+        shutdown_timeout_sec: float = 2.0,
+    ) -> None:
+        self.session_factory = session_factory
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.interval_sec = interval_sec
+        self.lease_extension_sec = lease_extension_sec
+        self.last_known_locked_until: datetime | None = _normalize_datetime(initial_locked_until)
+        self.worker_stop_event = worker_stop_event
+        self.shutdown_timeout_sec = shutdown_timeout_sec
+
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._renewal_lock = threading.Lock()
+
+        # Outcome state
+        self.lost_ownership: bool = False
+        self.consecutive_transient_failures: int = 0
+        self.last_transient_error: str | None = None
+        self.successful_renewals: int = 0
+        self.clean_shutdown: bool = True
+        self._in_flight: bool = False
+
+    @property
+    def is_alive(self) -> bool:
+        """Return True if background heartbeat thread is currently running."""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def is_renewal_in_flight(self) -> bool:
+        """Return True if a lease renewal transaction is actively executing."""
+        with self._lock:
+            return self._in_flight
+
+    def is_lease_uncertain(self, reference_time: datetime | None = None) -> bool:
+        """Return True if the lease has expired or is in an unknown/uncertain state.
+
+        Preserves safety: if transient failures or delays prevented lease extension and
+        the last known lease has lapsed, findings must not be committed to prevent overwriting
+        newer worker or reaper state.
+
+        Lease expiry is verified independently of the transient failure counter: an expired
+        or missing lease is never treated as healthy simply because no transient exceptions
+        were recorded.
+        """
+        with self._lock:
+            if self.lost_ownership:
+                return True  # Confirmed lost ownership cannot be reported as valid/healthy
+
+            if self.last_known_locked_until is None:
+                return True  # Unknown/null lease cannot be confirmed valid
+
+            check_time = reference_time or utc_now()
+            check_time_utc = _normalize_datetime(check_time)
+            last_utc = _normalize_datetime(self.last_known_locked_until)
+
+            if last_utc is None or check_time_utc is None:
+                return True
+
+            # Strict boundary: locked_until == now is still valid; strictly less than is expired
+            return last_utc < check_time_utc
+
+    def renew_once(self, now: datetime | None = None) -> bool:
+        """Execute a single lease renewal in a dedicated short transaction.
+
+        Returns:
+            True if heartbeat should continue running, False if ownership is lost
+            or heartbeat should terminate.
+        """
+        with self._renewal_lock:
+            with self._lock:
+                if self._stop_event.is_set() or (
+                    self.worker_stop_event is not None and self.worker_stop_event.is_set()
+                ):
+                    return False
+                self._in_flight = True
+
+            try:
+                current_time = now or utc_now()
+                with session_scope(self.session_factory) as session:
+                    bind = session.get_bind()
+                    if bind is not None and getattr(bind.dialect, "name", "") == "postgresql":
+                        # Bounded statement timeout for PostgreSQL to prevent queries hanging indefinitely
+                        session.execute(text("SET LOCAL statement_timeout = '3000'"))
+
+                    renewed = renew_job_lease(
+                        session,
+                        job_id=self.job_id,
+                        worker_id=self.worker_id,
+                        extension_sec=self.lease_extension_sec,
+                        now=current_time,
+                        auto_commit=False,
+                    )
+
+                    # Synchronized pre-commit decision and commit execution:
+                    # Holds _lock to ensure stop() cannot interleave between the stop check
+                    # and session.commit(). If shutdown wins the lock first, session rolls back
+                    # and counters/lease timestamps are not updated. If commit wins, it completes
+                    # before shutdown establishes its boundary.
+                    with self._lock:
+                        if self._stop_event.is_set() or (
+                            self.worker_stop_event is not None and self.worker_stop_event.is_set()
+                        ):
+                            session.rollback()
+                            logger.info(
+                                "Worker %s aborted in-flight lease renewal commit for job %s due to shutdown signal",
+                                self.worker_id,
+                                self.job_id,
+                            )
+                            return False
+
+                        session.commit()
+
+                        self.last_known_locked_until = _normalize_datetime(renewed.locked_until)
+                        self.consecutive_transient_failures = 0
+                        self.last_transient_error = None
+                        self.successful_renewals += 1
+
+                    logger.debug(
+                        "Heartbeat extended lease for job %s until %s (worker: %s)",
+                        self.job_id,
+                        self.last_known_locked_until,
+                        self.worker_id,
+                    )
+                    return True
+            except (JobOwnershipError, JobInvalidStateError, JobNotFoundError) as exc:
+                with self._lock:
+                    self.lost_ownership = True
+                sanitized = sanitize_failure_message(str(exc))
+                logger.warning(
+                    "Worker %s lost ownership of job %s during lease renewal: %s",
+                    self.worker_id,
+                    self.job_id,
+                    sanitized,
+                )
+                return False
+            except Exception as exc:  # noqa: BLE001 - keep heartbeat alive across transient DB errors
+                with self._lock:
+                    self.consecutive_transient_failures += 1
+                    self.last_transient_error = sanitize_failure_message(str(exc))
+                logger.warning(
+                    "Worker %s encountered transient error renewing lease for job %s (failure count: %d): %s",
+                    self.worker_id,
+                    self.job_id,
+                    self.consecutive_transient_failures,
+                    self.last_transient_error,
+                )
+                return True
+            finally:
+                with self._lock:
+                    self._in_flight = False
+
+    def _run_heartbeat(self) -> None:
+        """Background loop executing periodic lease renewal."""
+        while not self._stop_event.is_set():
+            # Wait for interval_sec or until signaled to stop
+            if self._stop_event.wait(self.interval_sec):
+                break
+
+            # If worker is shutting down or signaled to stop, exit cleanly
+            if self.worker_stop_event is not None and self.worker_stop_event.is_set():
+                break
+
+            should_continue = self.renew_once()
+            if not should_continue:
+                break
+
+    def start(self) -> None:
+        """Start the background heartbeat thread."""
+        self._thread = threading.Thread(
+            target=self._run_heartbeat,
+            name=f"heartbeat-{self.job_id}-{self.worker_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float | None = None) -> bool:
+        """Signal the heartbeat thread to stop and wait for it to cleanly terminate.
+
+        Synchronizes with renew_once(): boundedly acquires _lock so that if a renewal
+        commit is actively executing, that critical section finishes before shutdown
+        establishes its boundary. If shutdown wins the lock first, _stop_event is set so
+        that renew_once() safely aborts and rolls back.
+
+        Returns:
+            True if heartbeat cleanly terminated within timeout, False if it timed out.
+        """
+        start_mono = time.monotonic()
+        effective_timeout = timeout if timeout is not None else self.shutdown_timeout_sec
+
+        lock_acquired = self._lock.acquire(timeout=effective_timeout)
+        if lock_acquired:
+            try:
+                self._stop_event.set()
+            finally:
+                self._lock.release()
+        else:
+            self._stop_event.set()
+
+        elapsed = time.monotonic() - start_mono
+        remaining_timeout = max(0.0, effective_timeout - elapsed)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=remaining_timeout)
+
+        with self._lock:
+            self.clean_shutdown = self._thread is None or not self._thread.is_alive()
+            if not self.clean_shutdown:
+                logger.critical(
+                    "Worker %s heartbeat thread for job %s failed to terminate within %.1fs timeout (is_alive=%s, in_flight=%s)",
+                    self.worker_id,
+                    self.job_id,
+                    effective_timeout,
+                    self.is_alive,
+                    self._in_flight,
+                )
+            return self.clean_shutdown
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
+        self.stop()
+
+
 class JobWorker:
     """Production background worker for Sentinel scan queue polling and execution."""
 
@@ -51,7 +318,9 @@ class JobWorker:
         scanner: ScannerInterface | None = None,
         poll_interval_sec: float | None = None,
         lease_duration_sec: int | None = None,
+        heartbeat_interval_sec: float | None = None,
         reaper_interval_sec: float | None = None,
+        heartbeat_shutdown_timeout_sec: float | None = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:12]}"
@@ -70,6 +339,46 @@ class JobWorker:
             if reaper_interval_sec is not None
             else settings.WORKER_REAPER_INTERVAL_SEC
         )
+
+        if heartbeat_shutdown_timeout_sec is not None:
+            if (
+                isinstance(heartbeat_shutdown_timeout_sec, bool)
+                or not isinstance(heartbeat_shutdown_timeout_sec, (int, float))
+                or heartbeat_shutdown_timeout_sec <= 0
+            ):
+                raise ValueError("heartbeat_shutdown_timeout_sec must be a positive number")
+            self.heartbeat_shutdown_timeout_sec = float(heartbeat_shutdown_timeout_sec)
+        else:
+            self.heartbeat_shutdown_timeout_sec = 2.0
+
+        # Validation for worker queue lease and heartbeat parameters
+        if (
+            isinstance(self.lease_duration_sec, bool)
+            or not isinstance(self.lease_duration_sec, int)
+            or self.lease_duration_sec <= 0
+        ):
+            raise ValueError("lease_duration_sec must be a positive integer")
+
+        if heartbeat_interval_sec is not None:
+            if (
+                isinstance(heartbeat_interval_sec, bool)
+                or not isinstance(heartbeat_interval_sec, (int, float))
+                or heartbeat_interval_sec <= 0
+            ):
+                raise ValueError("heartbeat_interval_sec must be a positive number")
+            self.heartbeat_interval_sec = float(heartbeat_interval_sec)
+        elif self.lease_duration_sec < settings.WORKER_HEARTBEAT_SEC:
+            # Scale down heartbeat interval to remain strictly less than lease duration
+            self.heartbeat_interval_sec = max(0.1, float(self.lease_duration_sec) / 3.0)
+        else:
+            self.heartbeat_interval_sec = float(settings.WORKER_HEARTBEAT_SEC)
+
+        if self.heartbeat_interval_sec >= self.lease_duration_sec:
+            raise ValueError(
+                f"heartbeat_interval_sec ({self.heartbeat_interval_sec}) must be strictly less "
+                f"than lease_duration_sec ({self.lease_duration_sec})"
+            )
+
         self._last_reap_mono: float = 0.0
         self._stop_event = threading.Event()
 
@@ -181,6 +490,7 @@ class JobWorker:
         start_time = now or utc_now()
         raw_payload: Any = None
         job_type: str = ""
+        initial_locked_until: datetime | None = None
 
         # Phase 1: Retrieve claimed job, validate state and ownership, extract payload
         with session_scope(self.session_factory) as session:
@@ -213,6 +523,7 @@ class JobWorker:
 
             job_type = job.type
             raw_payload = job.payload
+            initial_locked_until = job.locked_until
 
         # Phase 1.1: Validate supported job type
         if job_type != "scan":
@@ -250,12 +561,52 @@ class JobWorker:
                 )
 
         # Phase 2: Execute scanner completely outside any database session or connection
+        # Scoped background heartbeat periodically renews the lease for long-running scans
+        scan_result: ScanExecutionResult
+        heartbeat = JobHeartbeat(
+            session_factory=self.session_factory,
+            job_id=job_id,
+            worker_id=self.worker_id,
+            interval_sec=self.heartbeat_interval_sec,
+            lease_extension_sec=self.lease_duration_sec,
+            initial_locked_until=initial_locked_until,
+            worker_stop_event=self._stop_event,
+            shutdown_timeout_sec=self.heartbeat_shutdown_timeout_sec,
+        )
         try:
-            scan_result = self.scanner.scan(payload)
+            with heartbeat:
+                scan_result = self.scanner.scan(payload)
         except Exception as exc:  # noqa: BLE001 - catch unexpected scanner crashes to fail job
+            # If heartbeat failed to terminate cleanly or renewal is in-flight, fail closed without updating DB
+            if heartbeat.is_alive or heartbeat.is_renewal_in_flight or not heartbeat.clean_shutdown:
+                logger.critical(
+                    "Job %s scanner crashed but heartbeat thread failed to shut down cleanly (is_alive=%s, in_flight=%s, clean=%s); failing closed without updating job",
+                    job_id,
+                    heartbeat.is_alive,
+                    heartbeat.is_renewal_in_flight,
+                    heartbeat.clean_shutdown,
+                )
+                return None
+
+            # If ownership was confirmed lost during scan, discard crash result
+            if heartbeat.lost_ownership:
+                logger.warning(
+                    "Job %s scanner crashed after worker %s lost lease ownership; discarding stale error",
+                    job_id,
+                    self.worker_id,
+                )
+                return None
+            if heartbeat.is_lease_uncertain(completion_now or utc_now()):
+                logger.warning(
+                    "Job %s scanner crashed with uncertain lease status on worker %s; discarding stale error",
+                    job_id,
+                    self.worker_id,
+                )
+                return None
+
             sanitized_exc = sanitize_failure_message(str(exc))
             logger.error("Job %s scanner execution raised error: %s", job_id, sanitized_exc)
-            fail_time = completion_now or (now if now is not None else utc_now())
+            fail_time = completion_now or utc_now()
             with session_scope(self.session_factory) as session:
                 return fail_job(
                     session,
@@ -268,8 +619,39 @@ class JobWorker:
                     auto_commit=True,
                 )
 
+        finished_time = completion_now or utc_now()
+
+        # If heartbeat failed to terminate cleanly or renewal is in-flight, fail closed without updating DB
+        if heartbeat.is_alive or heartbeat.is_renewal_in_flight or not heartbeat.clean_shutdown:
+            logger.critical(
+                "Job %s scanner succeeded but heartbeat thread failed to shut down cleanly (is_alive=%s, in_flight=%s, clean=%s); failing closed without updating job",
+                job_id,
+                heartbeat.is_alive,
+                heartbeat.is_renewal_in_flight,
+                heartbeat.clean_shutdown,
+            )
+            return None
+
+        # If ownership was confirmed lost during scanning, do NOT call complete_job or fail_job
+        if heartbeat.lost_ownership:
+            logger.warning(
+                "Job %s lease ownership confirmed lost on worker %s; discarding scan results without updating job",
+                job_id,
+                self.worker_id,
+            )
+            return None
+
+        # If heartbeat status is uncertain (repeated transient renewal failures and expired lease),
+        # do not commit stale findings for safety
+        if heartbeat.is_lease_uncertain(finished_time):
+            logger.warning(
+                "Job %s lease status is uncertain on worker %s due to renewal errors; discarding scan results for safety",
+                job_id,
+                self.worker_id,
+            )
+            return None
+
         # Phase 3: Route scanner outcome through existing lifecycle functions in a fresh session
-        finished_time = completion_now or (now if now is not None else utc_now())
         with session_scope(self.session_factory) as session:
             return self._handle_scan_result(
                 session=session,

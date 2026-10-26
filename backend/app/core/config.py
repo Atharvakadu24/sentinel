@@ -130,6 +130,20 @@ class Settings(BaseSettings):
         return validate_fingerprint_key(self.FINGERPRINT_KEY.get_secret_value())
 
     @model_validator(mode="after")
+    def validate_worker_heartbeat_settings(self) -> Settings:
+        """Validate background worker queue lease and heartbeat settings."""
+        if self.WORKER_JOB_LEASE_SEC <= 0:
+            raise ValueError("WORKER_JOB_LEASE_SEC must be a positive integer")
+        if self.WORKER_HEARTBEAT_SEC <= 0:
+            raise ValueError("WORKER_HEARTBEAT_SEC must be a positive integer")
+        if self.WORKER_HEARTBEAT_SEC >= self.WORKER_JOB_LEASE_SEC:
+            raise ValueError(
+                f"WORKER_HEARTBEAT_SEC ({self.WORKER_HEARTBEAT_SEC}) must be strictly less "
+                f"than WORKER_JOB_LEASE_SEC ({self.WORKER_JOB_LEASE_SEC})"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_production_invariants(self) -> Settings:
         """Enforce production security invariants (Threat T1, T3, T13)."""
         if self.APP_ENV == "production":

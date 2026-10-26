@@ -77,6 +77,10 @@ class JobReapError(JobTransitionError):
     """Raised when an error occurs during expired job reaping."""
 
 
+class JobRenewalError(JobTransitionError):
+    """Raised when an error occurs during job lease renewal."""
+
+
 def _normalize_datetime(dt: datetime | None) -> datetime | None:
     """Ensure datetime has timezone info for consistent comparison across dialects."""
     if dt is None:
@@ -602,6 +606,169 @@ def retry_job(
         now=now,
         auto_commit=auto_commit,
     )
+
+
+def renew_job_lease(
+    session: Session,
+    *,
+    job_id: uuid.UUID,
+    worker_id: str,
+    extension_sec: int | None = None,
+    now: datetime | None = None,
+    auto_commit: bool = True,
+) -> Job:
+    """Extend the claim lease for an active running job on behalf of its current worker.
+
+    Implements Threat Mitigation T13 (Worker concurrency and leases) and Blueprint
+    Section 7/8.1 queue resilience.
+
+    A healthy worker processing a long-running scan invokes this operation periodically
+    (heartbeat) to advance `locked_until` so that the expired-job lease reaper does not
+    prematurely reclaim or terminate the job.
+
+    Requirements and Guards:
+    1. Validates that job_id is a valid UUID, worker_id is a non-empty string, and
+       extension_sec is a positive integer (rejects booleans, non-integers, and non-positive numbers).
+    2. Defaults extension_sec to WORKER_JOB_LEASE_SEC if not explicitly specified.
+    3. Inspects current state: validates that the job exists, is currently in 'running'
+       status, is owned by the supplied worker (locked_by matches), and has an unexpired lease
+       (locked_until >= current_time). An exact boundary match (locked_until == now) is valid;
+       NULL or expired leases are rejected.
+    4. Atomically updates `locked_until` to `now + extension_sec`, guarded by:
+       - Job.id == job_id
+       - Job.status == "running"
+       - Job.locked_by == worker_id
+       - Job.locked_until >= current_time
+    5. Detects concurrent conflicts: if atomic update returns 0 rows, re-inspects state to
+       raise the appropriate domain exception (JobNotFoundError, JobInvalidStateError,
+       or JobOwnershipError) rather than silently failing.
+    6. Respects auto_commit: commits on success if True; flushes without committing caller's
+       transaction if False. On unexpected errors or SQLAlchemy failures, rolls back and raises
+       JobRenewalError.
+
+    Args:
+        session: Active SQLAlchemy database session.
+        job_id: UUID of the running Job whose lease to extend.
+        worker_id: Non-empty identifier for the owning worker.
+        extension_sec: Positive integer seconds to extend the lease from reference timestamp.
+            Defaults to settings.WORKER_JOB_LEASE_SEC.
+        now: Reference timestamp for lease verification and new expiry calculation.
+            Defaults to utc_now().
+        auto_commit: If True (default), commits the transaction immediately.
+            If False, flushes changes to the session.
+
+    Returns:
+        The updated Job instance with extended locked_until.
+
+    Raises:
+        TypeError: If job_id is not a UUID.
+        ValueError: If worker_id is empty/whitespace or extension_sec is invalid.
+        JobNotFoundError: If the job does not exist.
+        JobInvalidStateError: If the job is not in 'running' status.
+        JobOwnershipError: If worker_id does not match locked_by, or the lease has expired.
+        JobRenewalError: If a database error occurs during lease renewal.
+    """
+    if not isinstance(job_id, uuid.UUID):
+        raise TypeError("job_id must be a UUID")
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        raise ValueError("worker_id must be a non-empty string")
+    clean_worker_id = worker_id.strip()
+
+    if extension_sec is None:
+        effective_extension = get_settings().WORKER_JOB_LEASE_SEC
+    elif (
+        isinstance(extension_sec, bool) or not isinstance(extension_sec, int) or extension_sec <= 0
+    ):
+        raise ValueError("extension_sec must be a positive integer")
+    else:
+        effective_extension = extension_sec
+
+    if now is None:
+        current_time = utc_now()
+    elif now.tzinfo is None:
+        current_time = now.replace(tzinfo=UTC)
+    else:
+        current_time = now
+
+    # Inspect current state first to provide precise domain exceptions without modifying session
+    try:
+        existing_job = session.get(Job, job_id)
+    except SQLAlchemyError as exc:
+        session.rollback()
+        raise JobRenewalError("Database error while inspecting job status") from exc
+
+    if existing_job is None:
+        raise JobNotFoundError(f"Job '{job_id}' does not exist")
+    if existing_job.status != "running":
+        raise JobInvalidStateError(
+            f"Job '{job_id}' is in status '{existing_job.status}', expected 'running'"
+        )
+    if existing_job.locked_by != clean_worker_id:
+        raise JobOwnershipError(
+            f"Job '{job_id}' is locked by worker '{existing_job.locked_by}', not '{clean_worker_id}'"
+        )
+    locked_until_utc = _normalize_datetime(existing_job.locked_until)
+    if locked_until_utc is None or locked_until_utc < current_time:
+        raise JobOwnershipError(
+            f"Lease for job '{job_id}' expired at '{existing_job.locked_until}' (current time: '{current_time}')"
+        )
+
+    new_locked_until = current_time + timedelta(seconds=effective_extension)
+
+    # Atomic UPDATE ensures concurrent workers or reaper cannot update after ownership is lost
+    stmt = (
+        update(Job)
+        .where(
+            Job.id == job_id,
+            Job.status == "running",
+            Job.locked_by == clean_worker_id,
+            Job.locked_until >= current_time,
+        )
+        .values(locked_until=new_locked_until)
+        .returning(Job)
+        .execution_options(synchronize_session="fetch")
+    )
+
+    try:
+        renewed_job = session.scalars(stmt).first()
+        if renewed_job is None:
+            # Re-inspect to classify concurrent state change precisely.
+            # Expire cached existing_job in identity map so session.get() queries current database state.
+            session.expire(existing_job)
+            conflicted = session.get(Job, job_id)
+            if conflicted is None:
+                raise JobNotFoundError(f"Job '{job_id}' does not exist")
+            if conflicted.status != "running":
+                raise JobInvalidStateError(
+                    f"Job '{job_id}' transitioned to status '{conflicted.status}' during renewal"
+                )
+            if conflicted.locked_by != clean_worker_id:
+                raise JobOwnershipError(
+                    f"Job '{job_id}' ownership transferred to worker '{conflicted.locked_by}' during renewal"
+                )
+            conflicted_until = _normalize_datetime(conflicted.locked_until)
+            if conflicted_until is None or conflicted_until < current_time:
+                raise JobOwnershipError(
+                    f"Lease for job '{job_id}' expired at '{conflicted.locked_until}' during renewal"
+                )
+            raise JobInvalidStateError(
+                f"Job '{job_id}' could not be renewed due to a concurrent conflict"
+            )
+
+        if auto_commit:
+            session.commit()
+        else:
+            session.flush()
+
+        return renewed_job
+    except (JobNotFoundError, JobInvalidStateError, JobOwnershipError):
+        raise
+    except SQLAlchemyError as exc:
+        session.rollback()
+        raise JobRenewalError("Database error while renewing job lease") from exc
+    except Exception as exc:
+        session.rollback()
+        raise JobRenewalError("Unexpected error while renewing job lease") from exc
 
 
 def reap_expired_jobs(

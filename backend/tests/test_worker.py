@@ -35,12 +35,16 @@ from app.db.models import Job, Project, Scan, User
 from app.services.job_service import (
     JobInvalidStateError,
     JobOwnershipError,
+    JobRenewalError,
+    _normalize_datetime,
     claim_next_job,
+    complete_job,
     reap_expired_jobs,
+    renew_job_lease,
 )
 from app.services.scan_service import MAX_FILE_BYTES, MAX_FILES_COUNT, MAX_TOTAL_BYTES
 from app.worker.payload import PayloadValidationError, validate_scan_payload
-from app.worker.runner import JobWorker
+from app.worker.runner import JobHeartbeat, JobWorker
 from app.worker.scanner import (
     CallableScannerEngine,
     DefaultScannerEngine,
@@ -782,8 +786,8 @@ class TestWorkerDispatchAndExecution:
         # Scan finishes 35 seconds later (past the 30-second lease window)
         t_finish = t0 + timedelta(seconds=35)
 
-        with pytest.raises(JobOwnershipError, match=r"Lease for job '.*' expired"):
-            worker.run_once(now=t0, completion_now=t_finish)
+        claimed = worker.run_once(now=t0, completion_now=t_finish)
+        assert claimed is True
 
         db_session.refresh(job)
         db_session.refresh(scan)
@@ -1067,12 +1071,700 @@ class TestWorkerReaperIntegration:
         claim_next_job(db_session, worker_id="w-slow-runner", lease_duration_sec=10, now=t0)
 
         # Worker processes job; mid-flight scanner triggers reap
-        # When phase 3 tries complete_job, it fails because job was reaped to 'queued'
-        with pytest.raises(JobInvalidStateError, match="expected 'running'"):
-            worker.process_job(job_id=job.id, now=t0, completion_now=t0 + timedelta(seconds=20))
+        # Completion is safely rejected and returns None without marking job succeeded
+        outcome = worker.process_job(
+            job_id=job.id, now=t0, completion_now=t0 + timedelta(seconds=20)
+        )
+        assert outcome is None
 
         db_session.refresh(job)
         db_session.refresh(scan)
         # Job must NOT be marked succeeded; remains queued from reaper
         assert job.status == "queued"
         assert scan.status == "queued"
+
+
+class TestWorkerHeartbeatIntegration:
+    """Integration tests for worker heartbeat, periodic lease renewal, and outcome safety."""
+
+    def test_scan_outlasting_original_lease_succeeds_with_heartbeat(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """A scan running longer than its claim lease succeeds because heartbeat renews it."""
+        scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        renewed_confirmed = threading.Event()
+        real_renew = renew_job_lease
+
+        def notifying_renew(session: Session, **kwargs: Any) -> Job:
+            res = real_renew(session, **kwargs)
+            renewed_confirmed.set()
+            return res
+
+        def slow_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            assert renewed_confirmed.wait(timeout=2.0), (
+                "Heartbeat did not advance locked_until during scan"
+            )
+            return ScanExecutionResult(
+                status=ScanStatus.SUCCEEDED,
+                components={"semgrep": "passed", "gitleaks": "passed"},
+                counts={"critical": 0, "high": 0, "medium": 0},
+            )
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-heartbeat-success",
+            lease_duration_sec=2,
+            heartbeat_interval_sec=0.04,
+            scanner=CallableScannerEngine(slow_scanner),
+        )
+
+        claimed = claim_next_job(
+            db_session,
+            worker_id="w-heartbeat-success",
+            lease_duration_sec=2,
+            now=t0,
+        )
+        assert claimed is not None
+
+        with patch("app.worker.runner.renew_job_lease", side_effect=notifying_renew):
+            worker.process_job(job_id=job.id, now=t0)
+
+        assert renewed_confirmed.is_set(), "Heartbeat did not advance locked_until during scan"
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status == "succeeded"
+        assert scan.status == "succeeded"
+        assert job.locked_by is None
+
+    def test_heartbeat_thread_exits_on_scan_success_and_failure(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Background heartbeat thread terminates promptly on both scanner success and crash."""
+        # 1. Success case
+        _scan1, job1 = _create_job_for_test(db_session, sample_project)
+        thread_holder_success: list[threading.Thread] = []
+
+        def success_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            for t in threading.enumerate():
+                if t.name.startswith("heartbeat-"):
+                    thread_holder_success.append(t)
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker1 = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-exit-succ",
+            lease_duration_sec=5,
+            heartbeat_interval_sec=0.05,
+            scanner=CallableScannerEngine(success_scanner),
+        )
+        claim_next_job(db_session, worker_id="w-exit-succ", lease_duration_sec=5)
+        worker1.process_job(job_id=job1.id)
+
+        assert len(thread_holder_success) >= 1
+        assert not thread_holder_success[0].is_alive(), (
+            "Heartbeat thread did not terminate on success"
+        )
+
+        # 2. Crash/failure case
+        _scan2, job2 = _create_job_for_test(db_session, sample_project)
+        thread_holder_fail: list[threading.Thread] = []
+
+        def failing_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            for t in threading.enumerate():
+                if t.name.startswith("heartbeat-"):
+                    thread_holder_fail.append(t)
+            raise RuntimeError("Scanner execution crashed")
+
+        worker2 = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-exit-fail",
+            lease_duration_sec=5,
+            heartbeat_interval_sec=0.05,
+            scanner=CallableScannerEngine(failing_scanner),
+        )
+        claim_next_job(db_session, worker_id="w-exit-fail", lease_duration_sec=5)
+        worker2.process_job(job_id=job2.id)
+
+        assert len(thread_holder_fail) >= 1
+        assert not thread_holder_fail[0].is_alive(), (
+            "Heartbeat thread did not terminate on scanner crash"
+        )
+
+        db_session.refresh(job2)
+        assert job2.status == "failed"
+
+    def test_lost_ownership_during_scan_discards_stale_results(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When ownership is lost mid-scan, results are discarded without complete_job or fail_job."""
+        scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-stale", lease_duration_sec=5, now=t0)
+
+        ownership_detected = threading.Event()
+        real_renew = renew_job_lease
+
+        def wrapped_renew(session: Session, **kwargs: Any) -> Job:
+            try:
+                return real_renew(session, **kwargs)
+            except JobOwnershipError:
+                ownership_detected.set()
+                raise
+
+        def stealing_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            # Another worker or admin takes ownership while scan is running
+            with session_factory() as s:
+                j = s.get(Job, job.id)
+                assert j is not None
+                j.locked_by = "w-thief"
+                s.commit()
+            assert ownership_detected.wait(timeout=2.0), (
+                "Heartbeat did not detect ownership change in time"
+            )
+            return ScanExecutionResult(
+                status=ScanStatus.SUCCEEDED,
+                components={"semgrep": "passed"},
+            )
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-stale",
+            lease_duration_sec=5,
+            heartbeat_interval_sec=0.03,
+            scanner=CallableScannerEngine(stealing_scanner),
+        )
+
+        with patch("app.worker.runner.renew_job_lease", side_effect=wrapped_renew):
+            outcome = worker.process_job(job_id=job.id, now=t0)
+
+        assert outcome is None, "Process job should return None when ownership is lost"
+
+        # Verify job was NOT overwritten to succeeded
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status == "running"
+        assert job.locked_by == "w-thief"
+        assert scan.status != "succeeded"
+
+    def test_transient_renewal_database_error_is_resilient(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Transient database errors during heartbeat do not terminate heartbeat prematurely."""
+        _scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-transient", lease_duration_sec=5, now=t0)
+
+        second_call_done = threading.Event()
+        call_count = 0
+        real_renew = renew_job_lease
+
+        def flaky_renew(session: Session, **kwargs: Any) -> Job:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise JobRenewalError("Transient operational connection drop")
+            res = real_renew(session, **kwargs)
+            second_call_done.set()
+            return res
+
+        def mock_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            assert second_call_done.wait(timeout=2.0), (
+                "Heartbeat did not complete second renewal in time"
+            )
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-transient",
+            lease_duration_sec=5,
+            heartbeat_interval_sec=0.03,
+            scanner=CallableScannerEngine(mock_scanner),
+        )
+
+        with patch("app.worker.runner.renew_job_lease", side_effect=flaky_renew):
+            outcome = worker.process_job(job_id=job.id, now=t0)
+
+        assert outcome is not None
+        assert call_count >= 2
+        db_session.refresh(job)
+        assert job.status == "succeeded"
+
+    def test_reaper_race_never_overwrites_reaped_job_state(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Reaped job state in queue is preserved and not overwritten by stale scanner output."""
+        scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-raced", lease_duration_sec=5, now=t0)
+
+        reaped_detected = threading.Event()
+        real_renew = renew_job_lease
+
+        def wrapped_renew(session: Session, **kwargs: Any) -> Job:
+            try:
+                return real_renew(session, **kwargs)
+            except JobInvalidStateError:
+                reaped_detected.set()
+                raise
+
+        def reaped_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            # During scan, reaper sweeps and resets job to queued
+            with session_factory() as s:
+                reap_expired_jobs(s, retry_delay_sec=10, now=t0 + timedelta(seconds=100))
+            assert reaped_detected.wait(timeout=2.0), (
+                "Heartbeat did not detect reaped job state in time"
+            )
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-raced",
+            lease_duration_sec=5,
+            heartbeat_interval_sec=0.03,
+            scanner=CallableScannerEngine(reaped_scanner),
+        )
+
+        with patch("app.worker.runner.renew_job_lease", side_effect=wrapped_renew):
+            outcome = worker.process_job(job_id=job.id, now=t0)
+
+        assert outcome is None
+
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        # Reaper set it to queued; worker must not have completed or failed it
+        assert job.status == "queued"
+        assert scan.status == "queued"
+
+    def test_uncertain_heartbeat_status_discards_findings_for_safety(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When renewals fail continuously and lease expires, findings are discarded safely."""
+        _scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-uncertain", lease_duration_sec=2, now=t0)
+
+        renew_attempted = threading.Event()
+
+        def always_fail_renew(session: Session, **kwargs: Any) -> Job:
+            renew_attempted.set()
+            raise JobRenewalError("Continuous network partitioned error")
+
+        def mock_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            assert renew_attempted.wait(timeout=2.0), "Heartbeat renewal was not attempted in time"
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-uncertain",
+            lease_duration_sec=2,
+            heartbeat_interval_sec=0.03,
+            scanner=CallableScannerEngine(mock_scanner),
+        )
+
+        # Finished time is past the 2-second lease
+        t_finish = t0 + timedelta(seconds=10)
+        with patch("app.worker.runner.renew_job_lease", side_effect=always_fail_renew):
+            outcome = worker.process_job(job_id=job.id, now=t0, completion_now=t_finish)
+
+        assert outcome is None, "Findings must be discarded when lease status is uncertain"
+        db_session.refresh(job)
+        assert job.status == "running"  # Not marked succeeded
+
+    def test_blocked_renewal_at_shutdown_fails_closed_and_prevents_finalization(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When renewal is blocked in DB during shutdown, finalization is prevented and worker fails closed."""
+        scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-blocked-hb", lease_duration_sec=10, now=t0)
+
+        renewal_started = threading.Event()
+        unblock_renewal = threading.Event()
+        real_renew = renew_job_lease
+
+        def blocking_renew(session: Session, **kwargs: Any) -> Job:
+            renewal_started.set()
+            unblock_renewal.wait(timeout=5.0)
+            return real_renew(session, **kwargs)
+
+        def fast_scanner(p: ScanJobPayload) -> ScanExecutionResult:
+            assert renewal_started.wait(timeout=2.0), "Renewal did not start in time"
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-blocked-hb",
+            lease_duration_sec=10,
+            heartbeat_interval_sec=0.01,
+            heartbeat_shutdown_timeout_sec=0.05,
+            scanner=CallableScannerEngine(fast_scanner),
+        )
+
+        try:
+            with patch("app.worker.runner.renew_job_lease", side_effect=blocking_renew):
+                outcome = worker.process_job(job_id=job.id, now=t0)
+        finally:
+            unblock_renewal.set()
+
+        # Finalization must NOT be executed: outcome is None, job is NOT succeeded
+        assert outcome is None
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status != "succeeded"
+        assert scan.status != "succeeded"
+
+    def test_renewal_returning_after_shutdown_signal_aborts_commit(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """A renewal returning from DB after stop event is set rolls back and does not extend lease."""
+        _scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-race-commit", lease_duration_sec=10, now=t0)
+
+        db_session.refresh(job)
+        initial_locked_until = job.locked_until
+
+        hb = JobHeartbeat(
+            session_factory=session_factory,
+            job_id=job.id,
+            worker_id="w-race-commit",
+            interval_sec=0.01,
+            lease_extension_sec=60,
+            initial_locked_until=initial_locked_until,
+            shutdown_timeout_sec=2.0,
+        )
+
+        query_executed = threading.Event()
+        shutdown_signaled = threading.Event()
+        real_renew = renew_job_lease
+
+        def intercepted_renew(session: Session, **kwargs: Any) -> Job:
+            result = real_renew(session, **kwargs)
+            query_executed.set()
+            assert shutdown_signaled.wait(timeout=2.0), "Stop was not signaled in time"
+            return result
+
+        with patch("app.worker.runner.renew_job_lease", side_effect=intercepted_renew):
+            hb.start()
+            assert query_executed.wait(timeout=2.0), "Renewal query did not execute"
+            hb._stop_event.set()
+            shutdown_signaled.set()
+            hb.stop(timeout=2.0)
+
+        # Confirm lease in database was NOT extended to t0 + 60s because commit was aborted
+        db_session.refresh(job)
+        assert job.locked_until == initial_locked_until
+        assert hb.successful_renewals == 0
+        assert hb.last_known_locked_until == _normalize_datetime(initial_locked_until)
+
+    def test_shutdown_attempt_during_commit_cannot_interleave_and_commit_wins(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When shutdown attempts to begin while commit is in flight, commit completes first and lease is extended."""
+        _scan, job = _create_job_for_test(db_session, sample_project)
+        t0 = utc_now()
+        claim_next_job(db_session, worker_id="w-commit-wins", lease_duration_sec=10, now=t0)
+
+        db_session.refresh(job)
+        initial_locked_until = job.locked_until
+
+        commit_in_flight = threading.Event()
+        release_commit = threading.Event()
+        stop_attempt_started = threading.Event()
+        stop_completed = threading.Event()
+
+        original_commit = Session.commit
+
+        def intercepted_commit(session_self: Session) -> None:
+            if not commit_in_flight.is_set():
+                commit_in_flight.set()
+                assert stop_attempt_started.wait(timeout=2.0), "Stop attempt was not initiated"
+                assert release_commit.wait(timeout=2.0), "Release commit was not signaled"
+            original_commit(session_self)
+
+        hb = JobHeartbeat(
+            session_factory=session_factory,
+            job_id=job.id,
+            worker_id="w-commit-wins",
+            interval_sec=0.01,
+            lease_extension_sec=60,
+            initial_locked_until=initial_locked_until,
+            shutdown_timeout_sec=2.0,
+        )
+
+        with patch.object(Session, "commit", side_effect=intercepted_commit, autospec=True):
+            hb.start()
+            # 1. Wait until heartbeat thread reaches the commit critical section
+            assert commit_in_flight.wait(timeout=2.0), "Heartbeat did not enter commit in time"
+
+            # 2. In a background thread, attempt to stop the heartbeat while commit holds _lock
+            def do_stop() -> None:
+                stop_attempt_started.set()
+                hb.stop(timeout=2.0)
+                stop_completed.set()
+
+            stop_thread = threading.Thread(target=do_stop, daemon=True)
+            stop_thread.start()
+
+            assert stop_attempt_started.wait(timeout=2.0), "Stop thread did not start"
+            # While commit holds _lock, stop cannot acquire _lock to establish shutdown boundary
+            assert hb._lock.locked(), "Heartbeat lock should be held by commit critical section"
+
+            # 3. Release commit critical section so commit finishes and releases _lock
+            release_commit.set()
+
+            # 4. Stop thread must complete cleanly
+            assert stop_completed.wait(timeout=2.0), "Heartbeat stop did not complete cleanly"
+            stop_thread.join(timeout=1.0)
+
+        # 5. Assert database effects: lease WAS extended by commit winning the race
+        db_session.refresh(job)
+        assert job.locked_until is not None
+        assert initial_locked_until is not None
+        assert job.locked_until > initial_locked_until
+        assert hb.successful_renewals == 1
+        assert not hb.is_alive
+        assert hb.clean_shutdown is True
+
+        # 6. Verify worker finalization: job completes cleanly and clears lease
+        completed = complete_job(
+            db_session,
+            job_id=job.id,
+            worker_id="w-commit-wins",
+            auto_commit=True,
+        )
+        assert completed.status == "succeeded"
+        assert completed.locked_by is None
+        assert completed.locked_until is None
+
+    def test_lease_uncertainty_boundary_conditions(
+        self,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """Deterministic boundary checks for JobHeartbeat.is_lease_uncertain()."""
+        t0 = utc_now()
+        locked_until = t0 + timedelta(seconds=10)
+
+        hb = JobHeartbeat(
+            session_factory=session_factory,
+            job_id=uuid.uuid4(),
+            worker_id="w-boundary",
+            interval_sec=1.0,
+            lease_extension_sec=30,
+            initial_locked_until=locked_until,
+        )
+
+        # 1. Check time before locked_until: valid
+        assert not hb.is_lease_uncertain(t0 + timedelta(seconds=5))
+
+        # 2. Check time exactly at locked_until: valid (boundary condition: locked_until == now is valid)
+        assert not hb.is_lease_uncertain(locked_until)
+
+        # 3. Check time 1 microsecond after locked_until with ZERO failures: UNCERTAIN!
+        assert hb.is_lease_uncertain(locked_until + timedelta(microseconds=1))
+
+        # 4. Unknown/missing last-known lease: UNCERTAIN!
+        hb_unknown = JobHeartbeat(
+            session_factory=session_factory,
+            job_id=uuid.uuid4(),
+            worker_id="w-boundary",
+            interval_sec=1.0,
+            lease_extension_sec=30,
+            initial_locked_until=None,
+        )
+        assert hb_unknown.is_lease_uncertain(t0)
+
+        # 5. Ownership lost: UNCERTAIN even before locked_until
+        hb.lost_ownership = True
+        assert hb.is_lease_uncertain(t0 + timedelta(seconds=5))
+
+        # 6. Transient failures present, but lease has not expired yet: not uncertain
+        hb_transient = JobHeartbeat(
+            session_factory=session_factory,
+            job_id=uuid.uuid4(),
+            worker_id="w-boundary",
+            interval_sec=1.0,
+            lease_extension_sec=30,
+            initial_locked_until=locked_until,
+        )
+        hb_transient.consecutive_transient_failures = 3
+        assert not hb_transient.is_lease_uncertain(t0 + timedelta(seconds=5))
+        # Once time passes locked_until, it becomes uncertain
+        assert hb_transient.is_lease_uncertain(locked_until + timedelta(seconds=1))
+
+    def test_long_running_scan_controlled_time_without_freezing_finalization(
+        self,
+        session_factory: sessionmaker[Session],
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Controlled start time allows long duration without freezing finalization timestamp."""
+        t_start = utc_now() - timedelta(seconds=10)
+        scan, job = _create_job_for_test(db_session, sample_project, run_after=t_start)
+        claim_next_job(
+            db_session,
+            worker_id="w-long-controlled",
+            lease_duration_sec=30,
+            now=t_start,
+        )
+
+        renew_done = threading.Event()
+        real_renew = renew_job_lease
+
+        def notifying_renew(session: Session, **kwargs: Any) -> Job:
+            res = real_renew(session, **kwargs)
+            renew_done.set()
+            return res
+
+        def simulated_long_scan(p: ScanJobPayload) -> ScanExecutionResult:
+            assert renew_done.wait(timeout=2.0), "Heartbeat did not renew lease in time"
+            return ScanExecutionResult(status=ScanStatus.SUCCEEDED)
+
+        worker = JobWorker(
+            session_factory=session_factory,
+            worker_id="w-long-controlled",
+            lease_duration_sec=30,
+            heartbeat_interval_sec=0.03,
+            scanner=CallableScannerEngine(simulated_long_scan),
+        )
+
+        with patch("app.worker.runner.renew_job_lease", side_effect=notifying_renew):
+            outcome = worker.process_job(job_id=job.id, now=t_start)
+
+        assert outcome is not None
+        db_session.refresh(job)
+        db_session.refresh(scan)
+        assert job.status == "succeeded"
+        assert scan.status == "succeeded"
+        assert scan.duration_ms is not None
+        assert scan.duration_ms >= 10000
+
+    def test_invalid_worker_heartbeat_and_lease_configuration(
+        self,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """JobWorker rejects invalid lease durations and heartbeat intervals."""
+        # Heartbeat >= Lease
+        with pytest.raises(
+            ValueError,
+            match=r"heartbeat_interval_sec.*must be strictly less than lease_duration_sec",
+        ):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=60,
+                heartbeat_interval_sec=60,
+            )
+        with pytest.raises(
+            ValueError,
+            match=r"heartbeat_interval_sec.*must be strictly less than lease_duration_sec",
+        ):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=60,
+                heartbeat_interval_sec=80,
+            )
+
+        # Zero or negative
+        with pytest.raises(ValueError, match="heartbeat_interval_sec must be a positive number"):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=60,
+                heartbeat_interval_sec=0,
+            )
+        with pytest.raises(ValueError, match="heartbeat_interval_sec must be a positive number"):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=60,
+                heartbeat_interval_sec=-5,
+            )
+        with pytest.raises(ValueError, match="lease_duration_sec must be a positive integer"):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=0,
+                heartbeat_interval_sec=15,
+            )
+        with pytest.raises(ValueError, match="lease_duration_sec must be a positive integer"):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=-10,
+                heartbeat_interval_sec=15,
+            )
+
+        # Booleans
+        with pytest.raises(ValueError, match="heartbeat_interval_sec must be a positive number"):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=60,
+                heartbeat_interval_sec=True,
+            )
+        with pytest.raises(ValueError, match="lease_duration_sec must be a positive integer"):
+            JobWorker(
+                session_factory=session_factory,
+                lease_duration_sec=False,
+                heartbeat_interval_sec=15,
+            )
+
+        # Valid custom configuration
+        valid_worker = JobWorker(
+            session_factory=session_factory,
+            lease_duration_sec=120,
+            heartbeat_interval_sec=30.0,
+        )
+        assert valid_worker.lease_duration_sec == 120
+        assert valid_worker.heartbeat_interval_sec == 30.0
+
+    def test_job_heartbeat_context_manager_and_uncertainty_logic(
+        self,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """JobHeartbeat context manager starts and stops thread and calculates uncertainty."""
+        job_id = uuid.uuid4()
+        now = utc_now()
+        hb = JobHeartbeat(
+            session_factory=session_factory,
+            job_id=job_id,
+            worker_id="w-hb-unit",
+            interval_sec=0.1,
+            lease_extension_sec=30,
+            initial_locked_until=now + timedelta(seconds=10),
+        )
+        assert not hb.is_alive
+        with hb:
+            assert hb.is_alive
+        assert not hb.is_alive
+
+        # Without failures, is_lease_uncertain is False
+        assert not hb.is_lease_uncertain(now)
+
+        # With transient failures and lapsed lease, is_lease_uncertain is True
+        hb.consecutive_transient_failures = 1
+        assert hb.is_lease_uncertain(now + timedelta(seconds=20))

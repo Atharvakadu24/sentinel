@@ -181,3 +181,43 @@ class TestSettings:
         assert (
             Settings(ENABLE_DEV_UNAUTHENTICATED_SCANS=True).ENABLE_DEV_UNAUTHENTICATED_SCANS is True
         )
+
+    def test_worker_settings_validation(self) -> None:
+        """Worker queue lease and heartbeat settings must be positive and heartbeat < lease."""
+        # Non-positive lease
+        with pytest.raises(
+            ValidationError, match="WORKER_JOB_LEASE_SEC must be a positive integer"
+        ):
+            Settings(WORKER_JOB_LEASE_SEC=0)
+        with pytest.raises(
+            ValidationError, match="WORKER_JOB_LEASE_SEC must be a positive integer"
+        ):
+            Settings(WORKER_JOB_LEASE_SEC=-10)
+
+        # Non-positive heartbeat
+        with pytest.raises(
+            ValidationError, match="WORKER_HEARTBEAT_SEC must be a positive integer"
+        ):
+            Settings(WORKER_HEARTBEAT_SEC=0)
+        with pytest.raises(
+            ValidationError, match="WORKER_HEARTBEAT_SEC must be a positive integer"
+        ):
+            Settings(WORKER_HEARTBEAT_SEC=-5)
+
+        # Heartbeat >= Lease
+        with pytest.raises(
+            ValidationError,
+            match=r"WORKER_HEARTBEAT_SEC \(60\) must be strictly less than WORKER_JOB_LEASE_SEC \(60\)",
+        ):
+            Settings(WORKER_JOB_LEASE_SEC=60, WORKER_HEARTBEAT_SEC=60)
+
+        with pytest.raises(
+            ValidationError,
+            match=r"WORKER_HEARTBEAT_SEC \(75\) must be strictly less than WORKER_JOB_LEASE_SEC \(60\)",
+        ):
+            Settings(WORKER_JOB_LEASE_SEC=60, WORKER_HEARTBEAT_SEC=75)
+
+        # Valid custom values
+        valid = Settings(WORKER_JOB_LEASE_SEC=120, WORKER_HEARTBEAT_SEC=30)
+        assert valid.WORKER_JOB_LEASE_SEC == 120
+        assert valid.WORKER_HEARTBEAT_SEC == 30

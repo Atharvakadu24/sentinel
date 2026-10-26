@@ -39,6 +39,7 @@ from app.services.job_service import (
     JobNotFoundError,
     JobOwnershipError,
     JobReapError,
+    JobRenewalError,
     JobServiceError,
     JobTransitionError,
     _normalize_datetime,
@@ -46,6 +47,7 @@ from app.services.job_service import (
     complete_job,
     fail_job,
     reap_expired_jobs,
+    renew_job_lease,
     retry_job,
     sanitize_failure_message,
 )
@@ -883,7 +885,7 @@ class TestJobCompletion:
     ) -> None:
         """Attempting to complete a job after its claim lease has expired raises JobOwnershipError."""
         t0 = utc_now()
-        _, job = _create_test_scan_and_job(db_session, sample_project)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
         claim_next_job(db_session, worker_id="worker-slow", lease_duration_sec=60, now=t0)
 
         t_expired = t0 + timedelta(seconds=120)
@@ -1249,8 +1251,9 @@ class TestJobFailure:
     ) -> None:
         """Attempting to fail a job after lease expiry raises JobOwnershipError."""
         t0 = utc_now()
-        _, job = _create_test_scan_and_job(db_session, sample_project)
-        claim_next_job(db_session, worker_id="w-stale", lease_duration_sec=60, now=t0)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claimed = claim_next_job(db_session, worker_id="w-stale", lease_duration_sec=60, now=t0)
+        assert claimed is not None
 
         t_expired = t0 + timedelta(seconds=100)
         with pytest.raises(JobOwnershipError, match="Lease for job .* expired"):
@@ -2260,3 +2263,332 @@ class TestJobReaper:
         db_session.refresh(job)
         assert job.status == "running"
         assert job.locked_by == "worker-2"
+
+
+class TestJobLeaseRenewal:
+    """Tests for job lease renewal service operations (renew_job_lease)."""
+
+    def test_job_renewal_error_hierarchy(self) -> None:
+        """JobRenewalError is a subclass of JobTransitionError and JobServiceError."""
+        assert issubclass(JobRenewalError, JobTransitionError)
+        assert issubclass(JobRenewalError, JobServiceError)
+
+    def test_renew_job_lease_success(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Active running job lease is successfully extended to reference_now + extension_sec."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claimed = claim_next_job(db_session, worker_id="w-renew", lease_duration_sec=60, now=t0)
+        assert claimed is not None
+        assert _normalize_datetime(claimed.locked_until) == t0 + timedelta(seconds=60)
+
+        t1 = t0 + timedelta(seconds=20)
+        renewed = renew_job_lease(
+            db_session,
+            job_id=job.id,
+            worker_id="w-renew",
+            extension_sec=90,
+            now=t1,
+        )
+
+        assert renewed.id == job.id
+        assert renewed.status == "running"
+        assert renewed.locked_by == "w-renew"
+        assert _normalize_datetime(renewed.locked_until) == t1 + timedelta(seconds=90)
+
+    def test_renew_job_lease_defaults_to_worker_job_lease_sec(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """When extension_sec is omitted, renewal defaults to WORKER_JOB_LEASE_SEC."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-default", lease_duration_sec=30, now=t0)
+
+        t1 = t0 + timedelta(seconds=15)
+        renewed = renew_job_lease(
+            db_session,
+            job_id=job.id,
+            worker_id="w-default",
+            now=t1,
+        )
+
+        from app.core.config import get_settings
+
+        expected_expiry = t1 + timedelta(seconds=get_settings().WORKER_JOB_LEASE_SEC)
+        assert _normalize_datetime(renewed.locked_until) == expected_expiry
+
+    def test_renew_job_lease_exact_boundary_accepted(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Exact boundary match (locked_until == now) is valid and successfully extended."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-boundary", lease_duration_sec=60, now=t0)
+
+        # Reference time equals exact current locked_until
+        t_boundary = t0 + timedelta(seconds=60)
+        renewed = renew_job_lease(
+            db_session,
+            job_id=job.id,
+            worker_id="w-boundary",
+            extension_sec=45,
+            now=t_boundary,
+        )
+
+        assert _normalize_datetime(renewed.locked_until) == t_boundary + timedelta(seconds=45)
+
+    def test_renew_job_lease_microsecond_past_expiry_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Lease expiration check is strict: 1 microsecond past locked_until is rejected."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-strict", lease_duration_sec=60, now=t0)
+
+        t_past = t0 + timedelta(seconds=60, microseconds=1)
+        with pytest.raises(JobOwnershipError, match=r"Lease for job '.*' expired"):
+            renew_job_lease(
+                db_session,
+                job_id=job.id,
+                worker_id="w-strict",
+                extension_sec=60,
+                now=t_past,
+            )
+
+    def test_renew_job_lease_wrong_owner_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Attempting to renew a job owned by another worker raises JobOwnershipError."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="worker-real", lease_duration_sec=60, now=t0)
+
+        with pytest.raises(
+            JobOwnershipError, match="locked by worker 'worker-real', not 'worker-imposter'"
+        ):
+            renew_job_lease(
+                db_session,
+                job_id=job.id,
+                worker_id="worker-imposter",
+                now=t0 + timedelta(seconds=10),
+            )
+
+    def test_renew_job_lease_missing_job_rejected(
+        self,
+        db_session: Session,
+    ) -> None:
+        """Renewing a non-existent job ID raises JobNotFoundError."""
+        missing_id = uuid.uuid4()
+        with pytest.raises(JobNotFoundError, match=f"Job '{missing_id}' does not exist"):
+            renew_job_lease(db_session, job_id=missing_id, worker_id="w-1")
+
+    def test_renew_job_lease_null_lease_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Running job with locked_until=None raises JobOwnershipError."""
+        _, job = _create_test_scan_and_job(db_session, sample_project)
+        job.status = "running"
+        job.locked_by = "w-null"
+        job.locked_until = None
+        db_session.commit()
+
+        with pytest.raises(JobOwnershipError, match="expired at 'None'"):
+            renew_job_lease(db_session, job_id=job.id, worker_id="w-null")
+
+    def test_renew_job_lease_non_running_states_rejected(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """Renewing jobs in 'queued', 'succeeded', 'failed', or 'dead' status raises JobInvalidStateError."""
+        for invalid_status in ("queued", "succeeded", "failed", "dead"):
+            _, job = _create_test_scan_and_job(db_session, sample_project, status=invalid_status)
+            job.locked_by = "w-1"
+            job.locked_until = utc_now() + timedelta(seconds=60)
+            db_session.commit()
+
+            with pytest.raises(
+                JobInvalidStateError, match=f"status '{invalid_status}', expected 'running'"
+            ):
+                renew_job_lease(db_session, job_id=job.id, worker_id="w-1")
+
+    def test_renew_job_lease_invalid_arguments_rejected(
+        self,
+        db_session: Session,
+    ) -> None:
+        """Invalid types, empty worker ID, booleans, and non-positive extensions are rejected."""
+        valid_id = uuid.uuid4()
+
+        # Non-UUID job_id
+        with pytest.raises(TypeError, match="job_id must be a UUID"):
+            renew_job_lease(db_session, job_id="not-a-uuid", worker_id="w-1")  # type: ignore[arg-type]
+
+        # Blank or empty worker_id
+        with pytest.raises(ValueError, match="worker_id must be a non-empty string"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="")
+        with pytest.raises(ValueError, match="worker_id must be a non-empty string"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="   ")
+
+        # Booleans
+        with pytest.raises(ValueError, match="extension_sec must be a positive integer"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="w-1", extension_sec=True)
+        with pytest.raises(ValueError, match="extension_sec must be a positive integer"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="w-1", extension_sec=False)
+
+        # Zero and negative integers
+        with pytest.raises(ValueError, match="extension_sec must be a positive integer"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="w-1", extension_sec=0)
+        with pytest.raises(ValueError, match="extension_sec must be a positive integer"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="w-1", extension_sec=-10)
+
+        # Floats
+        with pytest.raises(ValueError, match="extension_sec must be a positive integer"):
+            renew_job_lease(db_session, job_id=valid_id, worker_id="w-1", extension_sec=15.5)  # type: ignore[arg-type]
+
+    def test_renew_job_lease_auto_commit_false_with_rollback(
+        self,
+        db_session: Session,
+        sample_project: Project,
+    ) -> None:
+        """With auto_commit=False, changes are flushed but caller can roll back."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        _, job = _create_test_scan_and_job(db_session, sample_project, run_after=t0)
+        claim_next_job(db_session, worker_id="w-flush", lease_duration_sec=60, now=t0)
+
+        t1 = t0 + timedelta(seconds=20)
+        renewed = renew_job_lease(
+            db_session,
+            job_id=job.id,
+            worker_id="w-flush",
+            extension_sec=120,
+            now=t1,
+            auto_commit=False,
+        )
+
+        assert _normalize_datetime(renewed.locked_until) == t1 + timedelta(seconds=120)
+
+        # Caller rolls back transaction
+        db_session.rollback()
+        db_session.refresh(job)
+
+        # Lease must have reverted back to t0 + 60s
+        assert _normalize_datetime(job.locked_until) == t0 + timedelta(seconds=60)
+
+    def test_renew_job_lease_concurrent_ownership_change_classified(
+        self,
+        session_factory: sessionmaker[Session],
+        sample_project: Project,
+    ) -> None:
+        """When another worker steals the lock during renewal, JobOwnershipError is correctly classified."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        with session_factory() as s0:
+            _, job = _create_test_scan_and_job(s0, sample_project, run_after=t0)
+            claim_next_job(s0, worker_id="w-orig", lease_duration_sec=60, now=t0)
+
+        with session_factory() as s_worker:
+            # Pre-populate s_worker identity map while locked_by is still 'w-orig'
+            j_cached = s_worker.get(Job, job.id)
+            assert j_cached is not None
+            assert j_cached.locked_by == "w-orig"
+
+            # Another worker changes locked_by in an independent session
+            with session_factory() as s_other:
+                j_other = s_other.get(Job, job.id)
+                assert j_other is not None
+                j_other.locked_by = "w-thief"
+                s_other.commit()
+
+            # s_worker renews. Pre-check passes using identity map, but atomic update matches 0 rows.
+            # session.expire(existing_job) reloads fresh DB state and raises JobOwnershipError.
+            with pytest.raises(
+                JobOwnershipError, match="ownership transferred to worker 'w-thief' during renewal"
+            ):
+                renew_job_lease(
+                    s_worker,
+                    job_id=job.id,
+                    worker_id="w-orig",
+                    now=t0 + timedelta(seconds=10),
+                )
+
+    def test_renew_job_lease_concurrent_status_change_classified(
+        self,
+        session_factory: sessionmaker[Session],
+        sample_project: Project,
+    ) -> None:
+        """When reaper resets job status during renewal, JobInvalidStateError is correctly classified."""
+        t0 = datetime(2026, 10, 24, 10, 0, 0, tzinfo=UTC)
+        with session_factory() as s0:
+            _, job = _create_test_scan_and_job(s0, sample_project, run_after=t0)
+            claim_next_job(s0, worker_id="w-orig", lease_duration_sec=60, now=t0)
+
+        with session_factory() as s_worker:
+            # Pre-populate s_worker identity map while status is still 'running'
+            j_cached = s_worker.get(Job, job.id)
+            assert j_cached is not None
+            assert j_cached.status == "running"
+
+            with session_factory() as s_other:
+                j_other = s_other.get(Job, job.id)
+                assert j_other is not None
+                j_other.status = "queued"
+                j_other.locked_by = None
+                s_other.commit()
+
+            with pytest.raises(
+                JobInvalidStateError, match="transitioned to status 'queued' during renewal"
+            ):
+                renew_job_lease(
+                    s_worker,
+                    job_id=job.id,
+                    worker_id="w-orig",
+                    now=t0 + timedelta(seconds=10),
+                )
+
+
+class TestPostgresRenewalDialectCompilation:
+    """Verify that PostgreSQL engine generates proper atomic update guards and RETURNING for lease renewal."""
+
+    def test_postgres_renewal_query_includes_guards_and_returning(self) -> None:
+        """PostgreSQL dialect renders atomic update statement with status, ownership, and expiry guards."""
+        now = utc_now()
+        target_id = uuid.uuid4()
+        clean_worker = "w-pg-worker"
+        new_expiry = now + timedelta(seconds=60)
+
+        from sqlalchemy import update
+
+        stmt = (
+            update(Job)
+            .where(
+                Job.id == target_id,
+                Job.status == "running",
+                Job.locked_by == clean_worker,
+                Job.locked_until >= now,
+            )
+            .values(locked_until=new_expiry)
+            .returning(Job)
+        )
+
+        pg_engine = create_engine("postgresql+psycopg://user:pass@localhost:5432/testdb")
+        compiled = str(stmt.compile(pg_engine))
+
+        assert "UPDATE jobs SET locked_until" in compiled
+        assert "WHERE jobs.id =" in compiled
+        assert "jobs.status =" in compiled
+        assert "jobs.locked_by =" in compiled
+        assert "jobs.locked_until >=" in compiled
+        assert "RETURNING" in compiled
+        assert "jobs.id" in compiled
