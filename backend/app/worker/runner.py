@@ -22,6 +22,7 @@ from app.core.config import get_settings
 from app.db.base import utc_now
 from app.db.models import Job
 from app.db.session import dispose_engine, get_session_factory, session_scope
+from app.services.finding_service import persist_scan_findings
 from app.services.job_service import (
     JobInvalidStateError,
     JobNotFoundError,
@@ -670,49 +671,103 @@ class JobWorker:
     ) -> Job:
         """Route the structured scanner execution result to job and scan state."""
 
-        if scan_result.status == ScanStatus.SUCCEEDED:
-            completed_job = complete_job(
-                session,
-                job_id=job_id,
-                worker_id=self.worker_id,
-                scan_status="succeeded",
-                now=current_time,
-                null_payload=True,
-                auto_commit=False,
+        if scan_result.status in (ScanStatus.SUCCEEDED, ScanStatus.PARTIAL):
+            scan_terminal_status = (
+                "succeeded" if scan_result.status == ScanStatus.SUCCEEDED else "partial"
             )
-            if completed_job.scan is not None:
-                if scan_result.components is not None:
-                    completed_job.scan.components = scan_result.components
-                if scan_result.counts is not None:
-                    completed_job.scan.counts = scan_result.counts
-            session.commit()
-            logger.info("Job %s completed successfully", job_id)
-            return completed_job
+            try:
+                # 1. Fetch Job to extract associated Scan and Project IDs
+                job = session.get(Job, job_id)
+                if job is None:
+                    raise JobNotFoundError(f"Job '{job_id}' does not exist")
+                if job.scan is None:
+                    raise JobInvalidStateError(f"Job '{job_id}' has no associated scan")
 
-        elif scan_result.status == ScanStatus.PARTIAL:
-            completed_job = complete_job(
-                session,
-                job_id=job_id,
-                worker_id=self.worker_id,
-                scan_status="partial",
-                now=current_time,
-                null_payload=True,
-                auto_commit=False,
-            )
-            if completed_job.scan is not None:
-                if scan_result.components is not None:
-                    completed_job.scan.components = scan_result.components
-                if scan_result.counts is not None:
-                    completed_job.scan.counts = scan_result.counts
-                if scan_result.error_code is not None:
-                    completed_job.scan.error_code = scan_result.error_code
-                if scan_result.error_message is not None:
-                    completed_job.scan.error_message = sanitize_failure_message(
-                        scan_result.error_message
+                # 2. Persist findings prior to job completion if findings are present
+                persisted_counts: dict[str, int] | None = None
+                if scan_result.findings:
+                    persistence_result = persist_scan_findings(
+                        session=session,
+                        project_id=job.scan.project_id,
+                        scan_id=job.scan.id,
+                        findings=scan_result.findings,
+                        now=current_time,
+                        auto_commit=False,
                     )
-            session.commit()
-            logger.warning("Job %s completed with partial results", job_id)
-            return completed_job
+                    persisted_counts = persistence_result.counts
+
+                # 3. Transition job and scan state in the same transaction
+                completed_job = complete_job(
+                    session,
+                    job_id=job_id,
+                    worker_id=self.worker_id,
+                    scan_status=scan_terminal_status,
+                    now=current_time,
+                    null_payload=True,
+                    auto_commit=False,
+                )
+
+                if completed_job.scan is not None:
+                    if scan_result.components is not None:
+                        completed_job.scan.components = scan_result.components
+
+                    # Reconcile counts:
+                    # - If findings were persisted, use severity counts (merged with non-severity keys from scan_result.counts)
+                    # - Else if scan_result.counts was provided (e.g. by mock engines or zero findings), preserve it
+                    # - Else default to standard 5-level severity breakdown
+                    if persisted_counts is not None:
+                        merged_counts = dict(scan_result.counts or {})
+                        merged_counts.update(persisted_counts)
+                        completed_job.scan.counts = merged_counts
+                    elif scan_result.counts is not None:
+                        completed_job.scan.counts = scan_result.counts
+                    else:
+                        completed_job.scan.counts = {
+                            "critical": 0,
+                            "high": 0,
+                            "medium": 0,
+                            "low": 0,
+                            "info": 0,
+                        }
+
+                    if scan_result.status == ScanStatus.PARTIAL:
+                        if scan_result.error_code is not None:
+                            completed_job.scan.error_code = scan_result.error_code
+                        if scan_result.error_message is not None:
+                            completed_job.scan.error_message = sanitize_failure_message(
+                                scan_result.error_message
+                            )
+
+                # 4. Atomically commit finding rows, scan counts, and completion status
+                session.commit()
+                if scan_result.status == ScanStatus.SUCCEEDED:
+                    logger.info("Job %s completed successfully", job_id)
+                else:
+                    logger.warning("Job %s completed with partial results", job_id)
+                return completed_job
+
+            except (JobOwnershipError, JobInvalidStateError, JobNotFoundError):
+                session.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001 - catch unexpected finding persistence or completion errors
+                session.rollback()
+                sanitized_exc = sanitize_failure_message(str(exc))
+                logger.error(
+                    "Job %s failed during finding persistence or completion: %s",
+                    job_id,
+                    sanitized_exc,
+                )
+                with session_scope(self.session_factory) as fail_session:
+                    return fail_job(
+                        fail_session,
+                        job_id=job_id,
+                        worker_id=self.worker_id,
+                        error_message=f"Finding persistence failed: {sanitized_exc}",
+                        error_code="FINDING_PERSISTENCE_ERROR",
+                        retryable=False,
+                        now=current_time,
+                        auto_commit=True,
+                    )
 
         elif scan_result.status == ScanStatus.FAILED:
             failed_job = fail_job(

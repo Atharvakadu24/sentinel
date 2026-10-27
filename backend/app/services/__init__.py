@@ -1,5 +1,14 @@
 """Application service layer for Sentinel workflows."""
 
+from app.services.finding_service import (
+    FindingPersistenceError,
+    FindingServiceError,
+    PersistedFindingsResult,
+    ProjectMismatchError,
+    get_finding,
+    list_scan_findings,
+    persist_scan_findings,
+)
 from app.services.job_service import (
     JobClaimError,
     JobCompleteError,
@@ -36,6 +45,8 @@ from app.services.scan_service import (
 )
 
 __all__ = [
+    "FindingPersistenceError",
+    "FindingServiceError",
     "JobClaimError",
     "JobCompleteError",
     "JobFailureError",
@@ -46,6 +57,8 @@ __all__ = [
     "JobRenewalError",
     "JobServiceError",
     "JobTransitionError",
+    "PersistedFindingsResult",
+    "ProjectMismatchError",
     "ProjectNotFoundError",
     "ScanConflictError",
     "ScanNotFoundError",
@@ -58,9 +71,12 @@ __all__ = [
     "create_manual_scan",
     "create_scan_and_job",
     "fail_job",
+    "get_finding",
     "get_scan",
     "is_extension_supported",
     "is_minified_or_generated",
+    "list_scan_findings",
+    "persist_scan_findings",
     "reap_expired_jobs",
     "renew_job_lease",
     "retry_job",
