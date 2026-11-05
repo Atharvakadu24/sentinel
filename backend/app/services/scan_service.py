@@ -8,15 +8,18 @@ Mitigations T8 (Path safety) & T9 (Size limits and minified-file checks).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from pathlib import PurePosixPath
 from typing import Any
 
+import sqlalchemy as sa
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import Job, Project, Scan, User
 from app.domain.paths import normalize_and_validate_path
-from app.schemas.scan import ManualFileInput
+from app.schemas.scan import ManualFileInput, ScanStatus, ScanTrigger
 
 # Size and quantity boundaries (Workflow A)
 MAX_FILES_COUNT: int = 20
@@ -345,3 +348,70 @@ def create_manual_scan(
 def get_scan(session: Session, scan_id: uuid.UUID) -> Scan | None:
     """Retrieve an ORM Scan instance by its primary key ID."""
     return session.get(Scan, scan_id)
+
+
+def list_scans(
+    session: Session,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID | None = None,
+    status: Sequence[str | ScanStatus] | str | ScanStatus | None = None,
+    trigger: Sequence[str | ScanTrigger] | str | ScanTrigger | None = None,
+    pr_number: int | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[Scan], int]:
+    """Retrieve paginated scans belonging to projects owned by user_id with deterministic ordering.
+
+    Implements:
+    - Enforced tenant isolation in database query: joins Project and checks
+      Project.owner_user_id == user_id and Project.deleted_at.is_(None).
+    - Stable ordering: created_at DESC, id DESC.
+    - Filters: status, trigger, pr_number, project_id.
+    - Zero N+1 queries.
+    """
+    conditions: list[Any] = [
+        Project.owner_user_id == user_id,
+        Project.deleted_at.is_(None),
+    ]
+
+    if project_id is not None:
+        conditions.append(Scan.project_id == project_id)
+
+    if status is not None:
+        if isinstance(status, (list, tuple, set)):
+            status_vals = [s.value if hasattr(s, "value") else str(s) for s in status]
+            conditions.append(Scan.status.in_(status_vals))
+        else:
+            status_val = status.value if hasattr(status, "value") else str(status)
+            conditions.append(Scan.status == status_val)
+
+    if trigger is not None:
+        if isinstance(trigger, (list, tuple, set)):
+            trigger_vals = [t.value if hasattr(t, "value") else str(t) for t in trigger]
+            conditions.append(Scan.trigger.in_(trigger_vals))
+        else:
+            trigger_val = trigger.value if hasattr(trigger, "value") else str(trigger)
+            conditions.append(Scan.trigger == trigger_val)
+
+    if pr_number is not None:
+        conditions.append(Scan.pr_number == pr_number)
+
+    count_stmt = (
+        select(sa.func.count(Scan.id))
+        .select_from(Scan)
+        .join(Project, Scan.project_id == Project.id)
+        .where(*conditions)
+    )
+    total = session.scalar(count_stmt) or 0
+
+    stmt = (
+        select(Scan)
+        .join(Project, Scan.project_id == Project.id)
+        .where(*conditions)
+        .order_by(Scan.created_at.desc(), Scan.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    items = list(session.scalars(stmt).all())
+    return items, total

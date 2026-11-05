@@ -9,12 +9,34 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from app.db.models.scan import Scan
+
+
+class ScanTrigger(str, Enum):
+    """Scan trigger mechanisms matching ck_scans_trigger."""
+
+    MANUAL = "manual"
+    PULL_REQUEST = "pull_request"
+    RERUN = "rerun"
+
+
+class ScanStatus(str, Enum):
+    """Scan lifecycle and execution statuses matching ck_scans_status."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    SUPERSEDED = "superseded"
+    SKIPPED = "skipped"
 
 
 class ManualFileInput(BaseModel):
@@ -110,8 +132,10 @@ class ScanDetailResponse(BaseModel):
 
     id: uuid.UUID = Field(..., description="Unique scan run identifier.")
     project_id: uuid.UUID = Field(..., description="Associated project ID.")
-    trigger: str = Field(..., description="Scan trigger type ('manual', 'pull_request', 'rerun').")
-    status: str = Field(
+    trigger: ScanTrigger = Field(
+        ..., description="Scan trigger type ('manual', 'pull_request', 'rerun')."
+    )
+    status: ScanStatus = Field(
         ...,
         description="Current scan status ('queued', 'running', 'succeeded', 'failed', etc.).",
     )
@@ -196,3 +220,94 @@ class ScanDetailResponse(BaseModel):
             finished_at=scan.finished_at,
             duration_ms=scan.duration_ms,
         )
+
+
+class ScanListItem(BaseModel):
+    """Compact summary of a scan run for scan listings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID = Field(..., description="Unique scan run identifier.")
+    project_id: uuid.UUID = Field(..., description="Associated project ID.")
+    trigger: ScanTrigger = Field(
+        ..., description="Scan trigger type ('manual', 'pull_request', 'rerun')."
+    )
+    status: ScanStatus = Field(
+        ...,
+        description="Current scan status ('queued', 'running', 'succeeded', 'failed', etc.).",
+    )
+    pr: ScanPRDetail | None = Field(
+        default=None,
+        description="Pull request details if triggered by a GitHub PR, else null.",
+    )
+    counts: dict[str, int] | None = Field(
+        default=None,
+        description="Finding counts breakdown by severity.",
+    )
+    report_status: str = Field(
+        default="not_applicable",
+        description="GitHub PR comment reporting status.",
+    )
+    error: ScanErrorDetail | None = Field(
+        default=None,
+        description="Scan failure details if status is failed, else null.",
+    )
+    queued_at: datetime = Field(..., description="Timestamp when scan was enqueued.")
+    started_at: datetime | None = Field(
+        default=None, description="Timestamp when scan execution started."
+    )
+    finished_at: datetime | None = Field(
+        default=None, description="Timestamp when scan execution completed."
+    )
+    duration_ms: int | None = Field(
+        default=None, description="Total scan execution duration in milliseconds."
+    )
+    created_at: datetime = Field(..., description="Record creation timestamp.")
+
+    @classmethod
+    def from_orm_model(cls, scan: Scan) -> ScanListItem:
+        """Construct ScanListItem from an ORM Scan instance."""
+        pr_detail: ScanPRDetail | None = None
+        if scan.pr_number is not None:
+            pr_detail = ScanPRDetail(
+                number=scan.pr_number,
+                head_sha=scan.head_sha,
+                title=scan.pr_title,
+            )
+
+        error_detail: ScanErrorDetail | None = None
+        if scan.error_code or scan.error_message:
+            error_detail = ScanErrorDetail(
+                code=scan.error_code or "UNKNOWN_ERROR",
+                message=scan.error_message or "",
+            )
+
+        return cls(
+            id=scan.id,
+            project_id=scan.project_id,
+            trigger=scan.trigger,
+            status=scan.status,
+            pr=pr_detail,
+            counts=scan.counts,
+            report_status=scan.report_status,
+            error=error_detail,
+            queued_at=scan.queued_at,
+            started_at=scan.started_at,
+            finished_at=scan.finished_at,
+            duration_ms=scan.duration_ms,
+            created_at=scan.created_at,
+        )
+
+
+class PaginatedScansResponse(BaseModel):
+    """Paginated scan list response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ScanListItem] = Field(..., description="Scans for the requested page.")
+    total: int = Field(..., ge=0, description="Total scans matching filters.")
+    limit: int = Field(..., ge=1, description="Page size limit applied.")
+    offset: int = Field(..., ge=0, description="Pagination offset applied.")
+
+
+ScanListResponse = PaginatedScansResponse

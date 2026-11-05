@@ -1,15 +1,18 @@
-"""API routes for scan creation and status inspection.
+"""API routes for scan creation, status inspection, and scan listings.
 
 Implements Blueprint Section 9.3 (Scans API contracts):
 - POST /projects/{id}/scans/manual: Enqueue manual analysis batch (202 Accepted)
+- GET /projects/{id}/scans: List scans for a project with filters & pagination (200 OK)
+- GET /scans: List scans across projects owned by user with filters & pagination (200 OK)
 - GET /scans/{id}: Get scan status and summary details (200 OK)
 """
 
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.api.deps import (
     CurrentUser,
@@ -19,8 +22,12 @@ from app.api.deps import (
 )
 from app.schemas.scan import (
     ManualScanCreateRequest,
+    PaginatedScansResponse,
     ScanCreateResponse,
     ScanDetailResponse,
+    ScanListItem,
+    ScanStatus,
+    ScanTrigger,
 )
 from app.services.scan_service import (
     ProjectNotFoundError,
@@ -30,6 +37,7 @@ from app.services.scan_service import (
     ScanValidationError,
     UserNotFoundError,
     create_manual_scan,
+    list_scans,
 )
 
 router = APIRouter(tags=["scans"])
@@ -95,6 +103,148 @@ def create_manual_scan_endpoint(
         id=scan.id,
         status=scan.status,
         status_url=f"/api/v1/scans/{scan.id}",
+    )
+
+
+@router.get(
+    "/projects/{project_id}/scans",
+    response_model=PaginatedScansResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List project scans",
+    description="Retrieve paginated scans for a project with filters and deterministic ordering.",
+)
+def list_project_scans_endpoint(
+    project_id: uuid.UUID,
+    session: DbSession,
+    user: CurrentUser,
+    status_filter: Annotated[
+        list[ScanStatus] | None,
+        Query(
+            alias="status",
+            description="Filter by scan status ('queued', 'running', 'succeeded', 'partial', 'failed', 'canceled', 'superseded', 'skipped').",
+        ),
+    ] = None,
+    trigger: Annotated[
+        list[ScanTrigger] | None,
+        Query(
+            description="Filter by scan trigger type ('manual', 'pull_request', 'rerun').",
+        ),
+    ] = None,
+    pr_number: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            description="Filter by pull request number.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=100,
+            description="Maximum number of scans to return per page.",
+        ),
+    ] = 20,
+    offset: Annotated[
+        int,
+        Query(
+            ge=0,
+            description="Number of scans to skip for pagination.",
+        ),
+    ] = 0,
+) -> PaginatedScansResponse:
+    """List scans belonging to a project owned by the authenticated user."""
+    verify_project_access(project_id, user, session)
+
+    items, total = list_scans(
+        session,
+        user_id=user.id,
+        project_id=project_id,
+        status=status_filter,
+        trigger=trigger,
+        pr_number=pr_number,
+        limit=limit,
+        offset=offset,
+    )
+
+    return PaginatedScansResponse(
+        items=[ScanListItem.from_orm_model(scan) for scan in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/scans",
+    response_model=PaginatedScansResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List scans across projects",
+    description="Retrieve paginated scans belonging to the authenticated user across projects.",
+)
+def list_user_scans_endpoint(
+    session: DbSession,
+    user: CurrentUser,
+    project_id: Annotated[
+        uuid.UUID | None,
+        Query(description="Optional filter by project ID."),
+    ] = None,
+    status_filter: Annotated[
+        list[ScanStatus] | None,
+        Query(
+            alias="status",
+            description="Filter by scan status ('queued', 'running', 'succeeded', 'partial', 'failed', 'canceled', 'superseded', 'skipped').",
+        ),
+    ] = None,
+    trigger: Annotated[
+        list[ScanTrigger] | None,
+        Query(
+            description="Filter by scan trigger type ('manual', 'pull_request', 'rerun').",
+        ),
+    ] = None,
+    pr_number: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            description="Filter by pull request number.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=100,
+            description="Maximum number of scans to return per page.",
+        ),
+    ] = 20,
+    offset: Annotated[
+        int,
+        Query(
+            ge=0,
+            description="Number of scans to skip for pagination.",
+        ),
+    ] = 0,
+) -> PaginatedScansResponse:
+    """List all scans belonging to projects owned by the authenticated user."""
+    if project_id is not None:
+        verify_project_access(project_id, user, session)
+
+    items, total = list_scans(
+        session,
+        user_id=user.id,
+        project_id=project_id,
+        status=status_filter,
+        trigger=trigger,
+        pr_number=pr_number,
+        limit=limit,
+        offset=offset,
+    )
+
+    return PaginatedScansResponse(
+        items=[ScanListItem.from_orm_model(scan) for scan in items],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

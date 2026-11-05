@@ -1140,3 +1140,574 @@ class TestFastAPIEndpoints:
         get_response = client.get(f"/api/v1/scans/{scan.id}")
         assert get_response.status_code == 404
         assert f"Scan with ID '{scan.id}' not found" in get_response.json()["detail"]
+
+
+class TestListScansEndpoints:
+    """Test suite for GET /projects/{project_id}/scans and GET /scans listing endpoints."""
+
+    def test_list_project_scans_pagination_and_deterministic_ordering(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        sample_user: User,
+        db_session: Session,
+    ) -> None:
+        """Verify deterministic ordering (created_at DESC, id DESC), pagination, and ScanListItem fields."""
+        base_time = utc_now()
+        # Create 3 scans with distinct creation timestamps
+        scan_oldest = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="manual:oldest",
+            status="succeeded",
+            counts={"critical": 0, "high": 1},
+            queued_at=base_time - timedelta(minutes=30),
+            created_at=base_time - timedelta(minutes=30),
+            created_by_user_id=sample_user.id,
+        )
+        scan_middle = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="manual:middle",
+            status="failed",
+            error_code="TIMEOUT",
+            error_message="Worker timeout",
+            queued_at=base_time - timedelta(minutes=15),
+            created_at=base_time - timedelta(minutes=15),
+            created_by_user_id=sample_user.id,
+        )
+        scan_newest = Scan(
+            project_id=sample_project.id,
+            trigger="pull_request",
+            trigger_key="pr:42:head1",
+            pr_number=42,
+            head_sha="a" * 40,
+            pr_title="Add auth feature",
+            status="queued",
+            queued_at=base_time,
+            created_at=base_time,
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add_all([scan_oldest, scan_middle, scan_newest])
+        db_session.commit()
+
+        # Page 1: limit=2, offset=0
+        resp1 = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"limit": 2, "offset": 0},
+        )
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["total"] == 3
+        assert data1["limit"] == 2
+        assert data1["offset"] == 0
+        assert len(data1["items"]) == 2
+
+        # Verify ordering: newest first, then middle
+        assert data1["items"][0]["id"] == str(scan_newest.id)
+        assert data1["items"][0]["trigger"] == "pull_request"
+        assert data1["items"][0]["status"] == "queued"
+        assert data1["items"][0]["pr"] == {
+            "number": 42,
+            "head_sha": "a" * 40,
+            "title": "Add auth feature",
+        }
+
+        assert data1["items"][1]["id"] == str(scan_middle.id)
+        assert data1["items"][1]["error"] == {
+            "code": "TIMEOUT",
+            "message": "Worker timeout",
+        }
+
+        # Page 2: limit=2, offset=2
+        resp2 = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"limit": 2, "offset": 2},
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["total"] == 3
+        assert data2["limit"] == 2
+        assert data2["offset"] == 2
+        assert len(data2["items"]) == 1
+        assert data2["items"][0]["id"] == str(scan_oldest.id)
+        assert data2["items"][0]["counts"] == {"critical": 0, "high": 1}
+
+    def test_list_scans_tenant_isolation(
+        self,
+        client: TestClient,
+        other_client: TestClient,
+        sample_project: Project,
+        other_project: Project,
+        sample_user: User,
+        other_user: User,
+        db_session: Session,
+    ) -> None:
+        """Tenant isolation: Users can only see their own scans; foreign project scan listing returns 404."""
+        # Create scans for User A (sample_user)
+        scan_a1 = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="a1",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        scan_a2 = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="a2",
+            status="queued",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        # Create scan for User B (other_user)
+        scan_b1 = Scan(
+            project_id=other_project.id,
+            trigger="manual",
+            trigger_key="b1",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=other_user.id,
+        )
+        db_session.add_all([scan_a1, scan_a2, scan_b1])
+        db_session.commit()
+
+        # User A project scans
+        resp_a = client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp_a.status_code == 200
+        assert resp_a.json()["total"] == 2
+        ids_a = {item["id"] for item in resp_a.json()["items"]}
+        assert ids_a == {str(scan_a1.id), str(scan_a2.id)}
+
+        # User B attempts to access User A's project scans -> 404 Not Found
+        resp_b_cross = other_client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp_b_cross.status_code == 404
+        assert f"Project with ID '{sample_project.id}' not found" in resp_b_cross.json()["detail"]
+
+        # User B lists scans cross-project via GET /scans -> only sees User B's scans
+        resp_b_all = other_client.get("/api/v1/scans")
+        assert resp_b_all.status_code == 200
+        assert resp_b_all.json()["total"] == 1
+        assert resp_b_all.json()["items"][0]["id"] == str(scan_b1.id)
+
+        # User B attempts GET /scans?project_id=A -> 404 Not Found
+        resp_b_filter_a = other_client.get(
+            "/api/v1/scans",
+            params={"project_id": str(sample_project.id)},
+        )
+        assert resp_b_filter_a.status_code == 404
+
+        # User A lists scans cross-project via GET /scans -> only sees User A's 2 scans
+        resp_a_all = client.get("/api/v1/scans")
+        assert resp_a_all.status_code == 200
+        assert resp_a_all.json()["total"] == 2
+
+    def test_list_scans_filters_status_trigger_pr(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        sample_user: User,
+        db_session: Session,
+    ) -> None:
+        """Filter scans by status, trigger, and pr_number."""
+        scan1 = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="t1",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        scan2 = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="t2",
+            status="failed",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        scan3 = Scan(
+            project_id=sample_project.id,
+            trigger="pull_request",
+            trigger_key="t3",
+            pr_number=99,
+            status="queued",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add_all([scan1, scan2, scan3])
+        db_session.commit()
+
+        # Filter by status=succeeded
+        resp_status = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"status": "succeeded"},
+        )
+        assert resp_status.status_code == 200
+        assert resp_status.json()["total"] == 1
+        assert resp_status.json()["items"][0]["id"] == str(scan1.id)
+
+        # Filter by trigger=pull_request
+        resp_trigger = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"trigger": "pull_request"},
+        )
+        assert resp_trigger.status_code == 200
+        assert resp_trigger.json()["total"] == 1
+        assert resp_trigger.json()["items"][0]["id"] == str(scan3.id)
+
+        # Filter by pr_number=99
+        resp_pr = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"pr_number": 99},
+        )
+        assert resp_pr.status_code == 200
+        assert resp_pr.json()["total"] == 1
+        assert resp_pr.json()["items"][0]["id"] == str(scan3.id)
+
+        # Multiple statuses: status=succeeded&status=failed
+        resp_multi_status = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params=[("status", "succeeded"), ("status", "failed")],
+        )
+        assert resp_multi_status.status_code == 200
+        assert resp_multi_status.json()["total"] == 2
+
+    def test_list_scans_empty_results(
+        self,
+        client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """User with no scans gets empty list with total=0."""
+        resp = client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["items"] == []
+        assert data["total"] == 0
+        assert data["limit"] == 20
+        assert data["offset"] == 0
+
+        resp_global = client.get("/api/v1/scans")
+        assert resp_global.status_code == 200
+        assert resp_global.json()["items"] == []
+        assert resp_global.json()["total"] == 0
+
+    def test_list_scans_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """Unauthenticated requests return 401."""
+        resp1 = unauthenticated_client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp1.status_code == 401
+
+        resp2 = unauthenticated_client.get("/api/v1/scans")
+        assert resp2.status_code == 401
+
+    def test_list_scans_validation_errors_return_422(
+        self,
+        client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """Out of bounds pagination or invalid pr_number parameters return 422 Unprocessable Content."""
+        assert client.get(f"/api/v1/projects/{sample_project.id}/scans?limit=0").status_code == 422
+        assert (
+            client.get(f"/api/v1/projects/{sample_project.id}/scans?limit=101").status_code == 422
+        )
+        assert (
+            client.get(f"/api/v1/projects/{sample_project.id}/scans?offset=-1").status_code == 422
+        )
+        assert (
+            client.get(f"/api/v1/projects/{sample_project.id}/scans?pr_number=0").status_code == 422
+        )
+        assert (
+            client.get(f"/api/v1/projects/{sample_project.id}/scans?pr_number=-10").status_code
+            == 422
+        )
+
+    def test_list_scans_soft_deleted_project_excluded(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        sample_user: User,
+        db_session: Session,
+    ) -> None:
+        """Soft-deleted project scans return 404 on project endpoint and are excluded from user scan list."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="del_test",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        sample_project.deleted_at = utc_now()
+        db_session.commit()
+
+        # Project endpoint returns 404
+        resp_proj = client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp_proj.status_code == 404
+
+        # Cross-project /scans excludes soft-deleted project's scan
+        resp_all = client.get("/api/v1/scans")
+        assert resp_all.status_code == 200
+        assert resp_all.json()["total"] == 0
+        assert resp_all.json()["items"] == []
+
+    def test_list_scans_root_and_api_v1_prefixes(
+        self,
+        client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """Both root /projects/{id}/scans and /api/v1/projects/{id}/scans routes succeed."""
+        resp_root = client.get(f"/projects/{sample_project.id}/scans")
+        assert resp_root.status_code == 200
+
+        resp_v1 = client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp_v1.status_code == 200
+
+        resp_root_scans = client.get("/scans")
+        assert resp_root_scans.status_code == 200
+
+        resp_v1_scans = client.get("/api/v1/scans")
+        assert resp_v1_scans.status_code == 200
+
+    def test_list_scans_deterministic_tie_breaking(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        sample_user: User,
+        db_session: Session,
+    ) -> None:
+        """Multiple scans with identical created_at timestamps are deterministically sorted by Scan.id.desc()."""
+        fixed_time = utc_now()
+        id_1 = uuid.UUID("11111111-1111-1111-1111-111111111111")
+        id_2 = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        id_3 = uuid.UUID("33333333-3333-3333-3333-333333333333")
+
+        scan1 = Scan(
+            id=id_1,
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="tie:1",
+            status="succeeded",
+            queued_at=fixed_time,
+            created_at=fixed_time,
+            created_by_user_id=sample_user.id,
+        )
+        scan2 = Scan(
+            id=id_2,
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="tie:2",
+            status="succeeded",
+            queued_at=fixed_time,
+            created_at=fixed_time,
+            created_by_user_id=sample_user.id,
+        )
+        scan3 = Scan(
+            id=id_3,
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="tie:3",
+            status="succeeded",
+            queued_at=fixed_time,
+            created_at=fixed_time,
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add_all([scan2, scan1, scan3])
+        db_session.commit()
+
+        resp = client.get(f"/api/v1/projects/{sample_project.id}/scans")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert len(items) == 3
+        # Should be ordered by id DESC: id_3, id_2, id_1
+        assert items[0]["id"] == str(id_3)
+        assert items[1]["id"] == str(id_2)
+        assert items[2]["id"] == str(id_1)
+
+    def test_list_scans_multi_value_trigger_filter(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        sample_user: User,
+        db_session: Session,
+    ) -> None:
+        """Repeated trigger query parameters return the correct combined results."""
+        scan_manual = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="trig:manual",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        scan_pr = Scan(
+            project_id=sample_project.id,
+            trigger="pull_request",
+            trigger_key="trig:pr",
+            pr_number=10,
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        scan_rerun = Scan(
+            project_id=sample_project.id,
+            trigger="rerun",
+            trigger_key="trig:rerun",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add_all([scan_manual, scan_pr, scan_rerun])
+        db_session.commit()
+
+        # Filter by trigger=manual&trigger=pull_request
+        resp = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params=[("trigger", "manual"), ("trigger", "pull_request")],
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        triggers = {item["trigger"] for item in data["items"]}
+        assert triggers == {"manual", "pull_request"}
+
+    def test_list_scans_cross_project_global_pagination(
+        self,
+        client: TestClient,
+        sample_user: User,
+        other_user: User,
+        sample_project: Project,
+        db_session: Session,
+    ) -> None:
+        """GET /scans paginates across multiple projects owned by the user and excludes foreign tenant scans."""
+        base_time = utc_now()
+
+        project_2 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="Second Project",
+            status="active",
+        )
+        foreign_project = Project(
+            owner_user_id=other_user.id,
+            kind="manual",
+            name="Foreign Tenant Project",
+            status="active",
+        )
+        db_session.add_all([project_2, foreign_project])
+        db_session.commit()
+
+        # User A Project 1: scan 1 (oldest: -30m) and scan 3 (newest: base_time)
+        scan_p1_old = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="p1:old",
+            status="succeeded",
+            queued_at=base_time - timedelta(minutes=30),
+            created_at=base_time - timedelta(minutes=30),
+            created_by_user_id=sample_user.id,
+        )
+        scan_p1_new = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="p1:new",
+            status="succeeded",
+            queued_at=base_time,
+            created_at=base_time,
+            created_by_user_id=sample_user.id,
+        )
+        # User A Project 2: scan 2 (middle: -15m)
+        scan_p2_mid = Scan(
+            project_id=project_2.id,
+            trigger="manual",
+            trigger_key="p2:mid",
+            status="succeeded",
+            queued_at=base_time - timedelta(minutes=15),
+            created_at=base_time - timedelta(minutes=15),
+            created_by_user_id=sample_user.id,
+        )
+        # Foreign tenant scan (base_time)
+        scan_foreign = Scan(
+            project_id=foreign_project.id,
+            trigger="manual",
+            trigger_key="foreign:scan",
+            status="succeeded",
+            queued_at=base_time,
+            created_at=base_time,
+            created_by_user_id=other_user.id,
+        )
+        db_session.add_all([scan_p1_old, scan_p1_new, scan_p2_mid, scan_foreign])
+        db_session.commit()
+
+        # Page 1: limit=2, offset=0
+        resp1 = client.get("/api/v1/scans", params={"limit": 2, "offset": 0})
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["total"] == 3
+        assert len(data1["items"]) == 2
+        assert data1["items"][0]["id"] == str(scan_p1_new.id)
+        assert data1["items"][0]["project_id"] == str(sample_project.id)
+        assert data1["items"][1]["id"] == str(scan_p2_mid.id)
+        assert data1["items"][1]["project_id"] == str(project_2.id)
+
+        # Page 2: limit=2, offset=2
+        resp2 = client.get("/api/v1/scans", params={"limit": 2, "offset": 2})
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["total"] == 3
+        assert len(data2["items"]) == 1
+        assert data2["items"][0]["id"] == str(scan_p1_old.id)
+        assert data2["items"][0]["project_id"] == str(sample_project.id)
+
+        # Ensure foreign tenant scan never appears
+        all_ids = {item["id"] for item in data1["items"] + data2["items"]}
+        assert str(scan_foreign.id) not in all_ids
+
+    def test_list_scans_invalid_status_and_trigger_return_422(
+        self,
+        client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """Invalid status and trigger query parameters return HTTP 422 Unprocessable Content."""
+        # Invalid status on project endpoint
+        resp_bad_status_proj = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"status": "invalid_status_xyz"},
+        )
+        assert resp_bad_status_proj.status_code == 422
+
+        # Invalid trigger on project endpoint
+        resp_bad_trigger_proj = client.get(
+            f"/api/v1/projects/{sample_project.id}/scans",
+            params={"trigger": "invalid_trigger_abc"},
+        )
+        assert resp_bad_trigger_proj.status_code == 422
+
+        # Invalid status on global /scans endpoint
+        resp_bad_status_global = client.get(
+            "/api/v1/scans",
+            params={"status": "invalid_status_xyz"},
+        )
+        assert resp_bad_status_global.status_code == 422
+
+        # Invalid trigger on global /scans endpoint
+        resp_bad_trigger_global = client.get(
+            "/api/v1/scans",
+            params={"trigger": "invalid_trigger_abc"},
+        )
+        assert resp_bad_trigger_global.status_code == 422
