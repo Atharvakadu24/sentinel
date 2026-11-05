@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import utc_now
 from app.db.models.finding import Finding, FindingStatusHistory
+from app.db.models.project import Project
 from app.db.models.scan import Scan, ScanFinding
 from app.domain.findings import (
     CanonicalFinding,
@@ -482,6 +483,126 @@ def list_scan_findings(session: Session, scan_id: uuid.UUID) -> list[ScanFinding
         .order_by(ScanFinding.start_line.asc(), ScanFinding.id.asc())
     )
     return list(session.scalars(stmt).all())
+
+
+def list_scan_findings_paginated(
+    session: Session,
+    *,
+    scan_id: uuid.UUID,
+    user_id: uuid.UUID,
+    status: Sequence[str | FindingStatus] | str | FindingStatus | None = None,
+    severity: Sequence[str | FindingSeverity] | str | FindingSeverity | None = None,
+    source: Sequence[str | FindingSource] | str | FindingSource | None = None,
+    in_diff: bool | None = None,
+    q: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Retrieve paginated findings observed in a specific scan with deterministic ordering and filters.
+
+    Implements:
+    - Tenant isolation: verified via user_id join against Project.
+    - Active project verification: Project.deleted_at must be None.
+    - Deterministic ordering: (file_path ASC, start_line ASC, id ASC).
+    - Filters: status, severity, source, in_diff, and text search q.
+    """
+    conditions: list[Any] = [
+        ScanFinding.scan_id == scan_id,
+        Project.owner_user_id == user_id,
+        Project.deleted_at.is_(None),
+    ]
+
+    if status is not None:
+        if isinstance(status, (list, tuple, set)):
+            status_vals = [s.value if hasattr(s, "value") else str(s) for s in status]
+            conditions.append(Finding.status.in_(status_vals))
+        else:
+            status_val = status.value if hasattr(status, "value") else str(status)
+            conditions.append(Finding.status == status_val)
+
+    if source is not None:
+        if isinstance(source, (list, tuple, set)):
+            source_vals = [s.value if hasattr(s, "value") else str(s) for s in source]
+            conditions.append(Finding.source.in_(source_vals))
+        else:
+            source_val = source.value if hasattr(source, "value") else str(source)
+            conditions.append(Finding.source == source_val)
+
+    if severity is not None:
+        if isinstance(severity, (list, tuple, set)):
+            sev_vals = [s.value if hasattr(s, "value") else str(s) for s in severity]
+            conditions.append(ScanFinding.severity.in_(sev_vals))
+        else:
+            sev_val = severity.value if hasattr(severity, "value") else str(severity)
+            conditions.append(ScanFinding.severity == sev_val)
+
+    if in_diff is not None:
+        conditions.append(ScanFinding.in_diff == in_diff)
+
+    if q is not None and q.strip():
+        clean_q = q.strip()
+        escaped_q = clean_q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_q}%"
+        conditions.append(
+            sa.or_(
+                Finding.title.ilike(pattern, escape="\\"),
+                Finding.file_path.ilike(pattern, escape="\\"),
+                Finding.rule_id.ilike(pattern, escape="\\"),
+            )
+        )
+
+    # Compute total count
+    count_stmt = (
+        select(sa.func.count(ScanFinding.id))
+        .select_from(ScanFinding)
+        .join(Finding, ScanFinding.finding_id == Finding.id)
+        .join(Scan, ScanFinding.scan_id == Scan.id)
+        .join(Project, Scan.project_id == Project.id)
+        .where(*conditions)
+    )
+    total = session.scalar(count_stmt) or 0
+
+    # Retrieve paginated items with stable, deterministic ordering
+    stmt = (
+        select(Finding, ScanFinding)
+        .select_from(ScanFinding)
+        .join(Finding, ScanFinding.finding_id == Finding.id)
+        .join(Scan, ScanFinding.scan_id == Scan.id)
+        .join(Project, Scan.project_id == Project.id)
+        .where(*conditions)
+        .order_by(Finding.file_path.asc(), ScanFinding.start_line.asc(), Finding.id.asc())
+        .offset(offset)
+        .limit(limit)
+    )
+
+    rows = session.execute(stmt).all()
+    results: list[dict[str, Any]] = []
+    for finding, scan_finding in rows:
+        results.append(
+            {
+                "id": finding.id,
+                "project_id": finding.project_id,
+                "fingerprint": finding.fingerprint,
+                "rule_id": finding.rule_id,
+                "source": finding.source,
+                "category": finding.category,
+                "title": finding.title,
+                "file_path": finding.file_path,
+                "status": finding.status,
+                "status_reason": finding.status_reason,
+                "status_updated_at": finding.status_updated_at,
+                "status_updated_by": finding.status_updated_by,
+                "severity": scan_finding.severity,
+                "confidence": scan_finding.confidence,
+                "first_seen_scan_id": finding.first_seen_scan_id,
+                "last_seen_scan_id": finding.last_seen_scan_id,
+                "first_seen_at": finding.first_seen_at,
+                "last_seen_at": finding.last_seen_at,
+                "created_at": finding.created_at,
+            }
+        )
+
+    return results, total
 
 
 def list_project_findings(

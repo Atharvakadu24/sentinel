@@ -1,10 +1,11 @@
-"""API routes for scan creation, status inspection, and scan listings.
+"""API routes for scan creation, status inspection, scan listings, and scan findings.
 
 Implements Blueprint Section 9.3 (Scans API contracts):
 - POST /projects/{id}/scans/manual: Enqueue manual analysis batch (202 Accepted)
 - GET /projects/{id}/scans: List scans for a project with filters & pagination (200 OK)
 - GET /scans: List scans across projects owned by user with filters & pagination (200 OK)
 - GET /scans/{id}: Get scan status and summary details (200 OK)
+- GET /scans/{id}/findings: List findings for a scan with filters & pagination (200 OK)
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from app.api.deps import (
     verify_project_access,
     verify_scan_access,
 )
+from app.domain.findings import FindingSeverity, FindingSource, FindingStatus
+from app.schemas.finding import FindingListItem, PaginatedFindingsResponse
 from app.schemas.scan import (
     ManualScanCreateRequest,
     PaginatedScansResponse,
@@ -29,6 +32,7 @@ from app.schemas.scan import (
     ScanStatus,
     ScanTrigger,
 )
+from app.services.finding_service import list_scan_findings_paginated
 from app.services.scan_service import (
     ProjectNotFoundError,
     ScanConflictError,
@@ -242,6 +246,91 @@ def list_user_scans_endpoint(
 
     return PaginatedScansResponse(
         items=[ScanListItem.from_orm_model(scan) for scan in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/scans/{scan_id}/findings",
+    response_model=PaginatedFindingsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List scan findings",
+    description="Retrieve paginated findings observed in a specific scan with filters, text search, and deterministic ordering.",
+    tags=["scans", "findings"],
+)
+def list_scan_findings_endpoint(
+    scan_id: uuid.UUID,
+    session: DbSession,
+    user: CurrentUser,
+    status_filter: Annotated[
+        list[FindingStatus] | None,
+        Query(
+            alias="status",
+            description="Filter by persistent status ('open', 'fixed', 'accepted', 'dismissed', 'false_positive').",
+        ),
+    ] = None,
+    severity: Annotated[
+        list[FindingSeverity] | None,
+        Query(
+            description="Filter by observed scan severity ('critical', 'high', 'medium', 'low', 'info').",
+        ),
+    ] = None,
+    source: Annotated[
+        list[FindingSource] | None,
+        Query(
+            description="Filter by detector source ('semgrep', 'gitleaks', 'ai').",
+        ),
+    ] = None,
+    in_diff: Annotated[
+        bool | None,
+        Query(
+            description="Filter by whether finding is located within git diff.",
+        ),
+    ] = None,
+    q: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=100,
+            description="Case-insensitive substring search across title, file path, and rule ID.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=100,
+            description="Maximum number of findings to return per page.",
+        ),
+    ] = 20,
+    offset: Annotated[
+        int,
+        Query(
+            ge=0,
+            description="Number of findings to skip for pagination.",
+        ),
+    ] = 0,
+) -> PaginatedFindingsResponse:
+    """List findings observed in a specific scan belonging to the authenticated user."""
+    scan = verify_scan_access(scan_id, user, session)
+
+    items, total = list_scan_findings_paginated(
+        session,
+        scan_id=scan.id,
+        user_id=user.id,
+        status=status_filter,
+        severity=severity,
+        source=source,
+        in_diff=in_diff,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+
+    return PaginatedFindingsResponse(
+        items=[FindingListItem.model_validate(item) for item in items],
         total=total,
         limit=limit,
         offset=offset,

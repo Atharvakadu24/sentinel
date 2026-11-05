@@ -31,10 +31,19 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings, get_settings
 from app.db.base import Base, utc_now
-from app.db.models import Job, Project, Scan, User, UserSession
+from app.db.models import Finding, Job, Project, Scan, User, UserSession
 from app.db.session import get_db_session, session_scope
+from app.domain.findings import (
+    CanonicalFinding,
+    FindingCategory,
+    FindingConfidence,
+    FindingSeverity,
+    FindingSource,
+    VerificationStatus,
+)
 from app.main import app
 from app.schemas.scan import ManualFileInput
+from app.services.finding_service import persist_scan_findings
 from app.services.scan_service import (
     MAX_FILE_BYTES,
     MAX_FILES_COUNT,
@@ -1711,3 +1720,459 @@ class TestListScansEndpoints:
             params={"trigger": "invalid_trigger_abc"},
         )
         assert resp_bad_trigger_global.status_code == 422
+
+
+def _make_canonical(
+    *,
+    rule_id: str = "rule.security.test",
+    source: FindingSource = FindingSource.SEMGREP,
+    category: FindingCategory = FindingCategory.INJECTION,
+    title: str = "Test Finding",
+    file_path: str = "src/test.py",
+    start_line: int = 1,
+    end_line: int | None = None,
+    severity: FindingSeverity = FindingSeverity.HIGH,
+    confidence: FindingConfidence = FindingConfidence.HIGH,
+    snippet: str | None = None,
+    in_diff: bool = True,
+    code_anchor: str | None = None,
+    verification_status: VerificationStatus | None = None,
+) -> CanonicalFinding:
+    """Helper to create a valid CanonicalFinding instance for tests."""
+    actual_end_line = end_line if end_line is not None else start_line + 1
+    actual_snippet = snippet if snippet is not None else f"code_{file_path}_{start_line}()"
+    actual_code_anchor = code_anchor
+    if actual_code_anchor is None and (
+        category == FindingCategory.HARDCODED_SECRET or source == FindingSource.GITLEAKS
+    ):
+        actual_code_anchor = hashlib.sha256(rule_id.encode("utf-8")).hexdigest()[:16]
+
+    actual_status = verification_status
+    if actual_status is None:
+        actual_status = (
+            VerificationStatus.AI_GROUNDED
+            if source == FindingSource.AI
+            else VerificationStatus.SCANNER_DETECTED
+        )
+
+    actual_confidence = confidence
+    if source == FindingSource.AI and actual_confidence == FindingConfidence.HIGH:
+        actual_confidence = FindingConfidence.MEDIUM
+
+    return CanonicalFinding.create_canonical(
+        rule_id=rule_id,
+        source=source,
+        category=category,
+        title=title,
+        description="Detailed description of test finding.",
+        severity=severity,
+        confidence=actual_confidence,
+        verification_status=actual_status,
+        file_path=file_path,
+        start_line=start_line,
+        end_line=actual_end_line,
+        snippet=actual_snippet,
+        remediation="Remediation guidance.",
+        in_diff=in_diff,
+        code_anchor=actual_code_anchor,
+    )
+
+
+class TestScanFindingsEndpoint:
+    """Integration and security tests for GET /scans/{scan_id}/findings."""
+
+    def test_list_scan_findings_pagination_and_ordering(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Findings are paginated and ordered by file_path ASC, start_line ASC, id ASC."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:order",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        # Create findings with varying file paths and line numbers
+        cf_b20 = _make_canonical(file_path="src/b.py", start_line=20, title="B20")
+        cf_a50 = _make_canonical(file_path="src/a.py", start_line=50, title="A50")
+        cf_a10 = _make_canonical(file_path="src/a.py", start_line=10, title="A10")
+        cf_b5 = _make_canonical(file_path="src/b.py", start_line=5, title="B5")
+        cf_c1_x = _make_canonical(
+            file_path="src/c.py", start_line=1, title="C1_X", rule_id="rule.x"
+        )
+        cf_c1_y = _make_canonical(
+            file_path="src/c.py", start_line=1, title="C1_Y", rule_id="rule.y"
+        )
+
+        persist_scan_findings(
+            db_session,
+            scan_id=scan.id,
+            project_id=sample_project.id,
+            findings=[cf_b20, cf_a50, cf_a10, cf_b5, cf_c1_x, cf_c1_y],
+        )
+        db_session.commit()
+
+        # Page 1 (limit=2, offset=0) -> src/a.py line 10, src/a.py line 50
+        resp1 = client.get(f"/api/v1/scans/{scan.id}/findings", params={"limit": 2, "offset": 0})
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["total"] == 6
+        assert len(data1["items"]) == 2
+        assert data1["limit"] == 2
+        assert data1["offset"] == 0
+        assert data1["items"][0]["file_path"] == "src/a.py"
+        assert data1["items"][0]["title"] == "A10"
+        assert data1["items"][1]["file_path"] == "src/a.py"
+        assert data1["items"][1]["title"] == "A50"
+
+        # Page 2 (limit=2, offset=2) -> src/b.py line 5, src/b.py line 20
+        resp2 = client.get(f"/api/v1/scans/{scan.id}/findings", params={"limit": 2, "offset": 2})
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["total"] == 6
+        assert len(data2["items"]) == 2
+        assert data2["items"][0]["file_path"] == "src/b.py"
+        assert data2["items"][0]["title"] == "B5"
+        assert data2["items"][1]["file_path"] == "src/b.py"
+        assert data2["items"][1]["title"] == "B20"
+
+        # Page 3 (limit=2, offset=4) -> src/c.py line 1 (tie broken by id ASC)
+        resp3 = client.get(f"/api/v1/scans/{scan.id}/findings", params={"limit": 2, "offset": 4})
+        assert resp3.status_code == 200
+        data3 = resp3.json()
+        assert data3["total"] == 6
+        assert len(data3["items"]) == 2
+        assert data3["items"][0]["file_path"] == "src/c.py"
+        assert data3["items"][1]["file_path"] == "src/c.py"
+        assert data3["items"][0]["id"] < data3["items"][1]["id"]
+
+    def test_list_scan_findings_tenant_isolation(
+        self,
+        client: TestClient,
+        other_client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+        other_project: Project,
+        other_user: User,
+    ) -> None:
+        """Tenant cannot view findings of another tenant's scan; fails closed with generic 404."""
+        scan_a = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:tenant_a",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        scan_b = Scan(
+            project_id=other_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:tenant_b",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=other_user.id,
+        )
+        db_session.add_all([scan_a, scan_b])
+        db_session.commit()
+
+        cf_a = _make_canonical(title="Tenant A Finding", file_path="src/tenant_a.py")
+        cf_b = _make_canonical(title="Tenant B Finding", file_path="src/tenant_b.py")
+        persist_scan_findings(
+            db_session, scan_id=scan_a.id, project_id=sample_project.id, findings=[cf_a]
+        )
+        persist_scan_findings(
+            db_session, scan_id=scan_b.id, project_id=other_project.id, findings=[cf_b]
+        )
+        db_session.commit()
+
+        # Other client attempts to view Scan A's findings -> 404
+        resp_b_on_a = other_client.get(f"/api/v1/scans/{scan_a.id}/findings")
+        assert resp_b_on_a.status_code == 404
+        assert resp_b_on_a.json()["detail"] == f"Scan with ID '{scan_a.id}' not found"
+
+        # Client attempts to view Scan B's findings -> 404
+        resp_a_on_b = client.get(f"/api/v1/scans/{scan_b.id}/findings")
+        assert resp_a_on_b.status_code == 404
+        assert resp_a_on_b.json()["detail"] == f"Scan with ID '{scan_b.id}' not found"
+
+        # Nonexistent scan ID returns identical generic 404
+        nonexistent_id = uuid.uuid4()
+        resp_nonexistent = client.get(f"/api/v1/scans/{nonexistent_id}/findings")
+        assert resp_nonexistent.status_code == 404
+        assert resp_nonexistent.json()["detail"] == f"Scan with ID '{nonexistent_id}' not found"
+
+    def test_list_scan_findings_soft_deleted_project_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Scan findings for a soft-deleted project fail closed with generic 404."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:soft_del",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        cf = _make_canonical(title="Pre-delete Finding", file_path="src/soft_delete.py")
+        persist_scan_findings(
+            db_session, scan_id=scan.id, project_id=sample_project.id, findings=[cf]
+        )
+        db_session.commit()
+
+        # Soft delete project
+        sample_project.deleted_at = utc_now()
+        db_session.commit()
+
+        resp = client.get(f"/api/v1/scans/{scan.id}/findings")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Scan with ID '{scan.id}' not found"
+
+    def test_list_scan_findings_filters(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Filter scan findings by status, severity, source, in_diff, and text search q."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:filters",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        cf1 = _make_canonical(
+            rule_id="sec.injection.sql",
+            source=FindingSource.SEMGREP,
+            severity=FindingSeverity.CRITICAL,
+            title="SQL Injection vulnerable call",
+            file_path="src/database.py",
+            in_diff=True,
+        )
+        cf2 = _make_canonical(
+            rule_id="sec.secret.stripe",
+            source=FindingSource.GITLEAKS,
+            category=FindingCategory.HARDCODED_SECRET,
+            severity=FindingSeverity.HIGH,
+            title="Stripe Secret API key exposed",
+            file_path="config/keys.py",
+            snippet="API_KEY = '[REDACTED:sec.secret.stripe]'",
+            in_diff=False,
+        )
+        cf3 = _make_canonical(
+            rule_id="perf.ai.memory",
+            source=FindingSource.AI,
+            severity=FindingSeverity.LOW,
+            title="Memory leak in event loop",
+            file_path="src/worker.py",
+            in_diff=True,
+        )
+
+        res = persist_scan_findings(
+            db_session,
+            scan_id=scan.id,
+            project_id=sample_project.id,
+            findings=[cf1, cf2, cf3],
+        )
+        db_session.commit()
+
+        # Update finding 2's persistent status to fixed
+        f2 = db_session.get(Finding, res.findings[1].id)
+        assert f2 is not None
+        f2.status = "fixed"
+        db_session.commit()
+
+        base_url = f"/api/v1/scans/{scan.id}/findings"
+
+        # 1. Filter by status
+        r_status_fixed = client.get(base_url, params={"status": "fixed"})
+        assert r_status_fixed.status_code == 200
+        assert r_status_fixed.json()["total"] == 1
+        assert r_status_fixed.json()["items"][0]["title"] == "Stripe Secret API key exposed"
+
+        r_status_multi = client.get(base_url, params=[("status", "open"), ("status", "fixed")])
+        assert r_status_multi.status_code == 200
+        assert r_status_multi.json()["total"] == 3
+
+        # 2. Filter by severity
+        r_sev_crit = client.get(base_url, params={"severity": "critical"})
+        assert r_sev_crit.status_code == 200
+        assert r_sev_crit.json()["total"] == 1
+        assert r_sev_crit.json()["items"][0]["title"] == "SQL Injection vulnerable call"
+
+        r_sev_multi = client.get(base_url, params=[("severity", "critical"), ("severity", "high")])
+        assert r_sev_multi.status_code == 200
+        assert r_sev_multi.json()["total"] == 2
+
+        # 3. Filter by source
+        r_src_gl = client.get(base_url, params={"source": "gitleaks"})
+        assert r_src_gl.status_code == 200
+        assert r_src_gl.json()["total"] == 1
+        assert r_src_gl.json()["items"][0]["rule_id"] == "sec.secret.stripe"
+
+        # 4. Filter by in_diff
+        r_diff_true = client.get(base_url, params={"in_diff": "true"})
+        assert r_diff_true.status_code == 200
+        assert r_diff_true.json()["total"] == 2
+
+        r_diff_false = client.get(base_url, params={"in_diff": "false"})
+        assert r_diff_false.status_code == 200
+        assert r_diff_false.json()["total"] == 1
+        assert r_diff_false.json()["items"][0]["title"] == "Stripe Secret API key exposed"
+
+        # 5. Text search q across title, file_path, and rule_id
+        r_q_title = client.get(base_url, params={"q": "injection"})
+        assert r_q_title.status_code == 200
+        assert r_q_title.json()["total"] == 1
+        assert r_q_title.json()["items"][0]["title"] == "SQL Injection vulnerable call"
+
+        # Case-insensitivity check
+        r_q_case = client.get(base_url, params={"q": "INJECTION"})
+        assert r_q_case.status_code == 200
+        assert r_q_case.json()["total"] == 1
+
+        r_q_path = client.get(base_url, params={"q": "config/"})
+        assert r_q_path.status_code == 200
+        assert r_q_path.json()["total"] == 1
+
+        r_q_rule = client.get(base_url, params={"q": "perf.ai"})
+        assert r_q_rule.status_code == 200
+        assert r_q_rule.json()["total"] == 1
+
+    def test_list_scan_findings_invalid_filter_returns_422(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Invalid pagination and filter query parameters return HTTP 422 Unprocessable Content."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:invalid",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        base_url = f"/api/v1/scans/{scan.id}/findings"
+
+        # Invalid pagination bounds
+        assert client.get(base_url, params={"limit": 0}).status_code == 422
+        assert client.get(base_url, params={"limit": 101}).status_code == 422
+        assert client.get(base_url, params={"offset": -1}).status_code == 422
+
+        # Invalid enum values
+        assert client.get(base_url, params={"status": "invalid_status_xyz"}).status_code == 422
+        assert client.get(base_url, params={"severity": "extreme_danger"}).status_code == 422
+        assert client.get(base_url, params={"source": "unsupported_tool"}).status_code == 422
+
+        # Invalid text search length (min_length=1, max_length=100)
+        assert client.get(base_url, params={"q": ""}).status_code == 422
+        assert client.get(base_url, params={"q": "a" * 101}).status_code == 422
+
+    def test_list_scan_findings_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Unauthenticated requests fail with HTTP 401 Unauthorized."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:unauth",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        resp = unauthenticated_client.get(f"/api/v1/scans/{scan.id}/findings")
+        assert resp.status_code == 401
+
+    def test_list_scan_findings_empty_scan(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Scan with zero findings returns 200 OK with empty items list and total=0."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:empty",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        resp = client.get(f"/api/v1/scans/{scan.id}/findings")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "items": [],
+            "total": 0,
+            "limit": 20,
+            "offset": 0,
+        }
+
+    def test_list_scan_findings_root_and_v1_routes(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_project: Project,
+        sample_user: User,
+    ) -> None:
+        """Both /scans/{id}/findings and /api/v1/scans/{id}/findings return identical responses."""
+        scan = Scan(
+            project_id=sample_project.id,
+            trigger="manual",
+            trigger_key="scan:findings:dual_route",
+            status="succeeded",
+            queued_at=utc_now(),
+            created_by_user_id=sample_user.id,
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        cf = _make_canonical(title="Dual Route Finding", file_path="src/routes.py")
+        persist_scan_findings(
+            db_session, scan_id=scan.id, project_id=sample_project.id, findings=[cf]
+        )
+        db_session.commit()
+
+        resp_v1 = client.get(f"/api/v1/scans/{scan.id}/findings")
+        resp_root = client.get(f"/scans/{scan.id}/findings")
+
+        assert resp_v1.status_code == 200
+        assert resp_root.status_code == 200
+        assert resp_v1.json() == resp_root.json()

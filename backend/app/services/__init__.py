@@ -7,6 +7,7 @@ from app.services.finding_service import (
     ProjectMismatchError,
     get_finding,
     list_scan_findings,
+    list_scan_findings_paginated,
     persist_scan_findings,
 )
 from app.services.job_service import (
@@ -76,6 +77,7 @@ __all__ = [
     "is_extension_supported",
     "is_minified_or_generated",
     "list_scan_findings",
+    "list_scan_findings_paginated",
     "persist_scan_findings",
     "reap_expired_jobs",
     "renew_job_lease",
