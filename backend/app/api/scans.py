@@ -8,13 +8,15 @@ Implements Blueprint Section 9.3 (Scans API contracts):
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, HTTPException, status
 
-from app.core.config import Settings, get_settings
-from app.db.session import get_db_session
+from app.api.deps import (
+    CurrentUser,
+    DbSession,
+    verify_project_access,
+    verify_scan_access,
+)
 from app.schemas.scan import (
     ManualScanCreateRequest,
     ScanCreateResponse,
@@ -28,13 +30,9 @@ from app.services.scan_service import (
     ScanValidationError,
     UserNotFoundError,
     create_manual_scan,
-    get_scan,
 )
 
 router = APIRouter(tags=["scans"])
-
-DbSession = Annotated[Session, Depends(get_db_session)]
-AppSettings = Annotated[Settings, Depends(get_settings)]
 
 
 @router.post(
@@ -48,21 +46,10 @@ def create_manual_scan_endpoint(
     project_id: uuid.UUID,
     body: ManualScanCreateRequest,
     session: DbSession,
-    settings: AppSettings,
+    user: CurrentUser,
 ) -> ScanCreateResponse:
     """Validate files and enqueue a manual scan for background processing."""
-    if (
-        settings.APP_ENV not in ("development", "test")
-        or not settings.ENABLE_DEV_UNAUTHENTICATED_SCANS
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=(
-                "Authentication required. Scan creation is disabled until session "
-                "authentication is active. In development or test environments, set "
-                "ENABLE_DEV_UNAUTHENTICATED_SCANS=true to enable unauthenticated testing."
-            ),
-        )
+    verify_project_access(project_id, user, session)
 
     try:
         scan, _ = create_manual_scan(
@@ -71,7 +58,7 @@ def create_manual_scan_endpoint(
             files=body.files,
             run_ai=body.run_ai,
             trigger_key=body.trigger_key,
-            created_by_user_id=None,  # Never trust client-supplied user identity
+            created_by_user_id=user.id,
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(
@@ -121,12 +108,8 @@ def create_manual_scan_endpoint(
 def get_scan_endpoint(
     scan_id: uuid.UUID,
     session: DbSession,
+    user: CurrentUser,
 ) -> ScanDetailResponse:
     """Retrieve full scan summary and status details."""
-    scan = get_scan(session, scan_id)
-    if scan is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Scan with ID '{scan_id}' not found",
-        )
+    scan = verify_scan_access(scan_id, user, session)
     return ScanDetailResponse.from_orm_model(scan)

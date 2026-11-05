@@ -17,6 +17,7 @@ from app.core.config import Settings, get_settings
 from app.db.base import utc_now
 from app.db.models.finding import Finding
 from app.db.models.project import Project
+from app.db.models.scan import Scan
 from app.db.models.user import User, UserSession
 from app.db.session import get_db_session
 
@@ -128,3 +129,35 @@ def verify_finding_access(
         )
 
     return finding
+
+
+def verify_scan_access(
+    scan_id: uuid.UUID,
+    user: CurrentUser,
+    session: DbSession,
+) -> Scan:
+    """Verify that scan exists and its project belongs to the authenticated user.
+
+    Threat Mitigation T4 (Tenant Isolation):
+    Fails closed with 404 Not Found if scan does not exist or its project
+    belongs to another tenant (preventing resource enumeration).
+    """
+    scan = session.get(Scan, scan_id)
+    if scan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan with ID '{scan_id}' not found",
+        )
+
+    stmt = select(Project).where(
+        Project.id == scan.project_id,
+        Project.deleted_at.is_(None),
+    )
+    project = session.scalars(stmt).first()
+    if project is None or project.owner_user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan with ID '{scan_id}' not found",
+        )
+
+    return scan

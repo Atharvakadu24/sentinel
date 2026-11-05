@@ -14,8 +14,10 @@ Validates Blueprint Section 7 (Workflow A: Manual code analysis), Section 8.1
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Generator
+from datetime import timedelta
 from typing import Any
 from unittest.mock import patch
 
@@ -28,8 +30,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings, get_settings
-from app.db.base import Base
-from app.db.models import Job, Project, Scan, User
+from app.db.base import Base, utc_now
+from app.db.models import Job, Project, Scan, User, UserSession
 from app.db.session import get_db_session, session_scope
 from app.main import app
 from app.schemas.scan import ManualFileInput
@@ -116,22 +118,81 @@ def sample_project(db_session: Session, sample_user: User) -> Project:
 
 
 @pytest.fixture
-def client(session_factory: sessionmaker[Session]) -> Generator[TestClient, None, None]:
-    """TestClient configured with dependency override for get_db_session and dev scan opt-in."""
+def other_user(db_session: Session) -> User:
+    """Second user for cross-tenant isolation testing."""
+    user = User(
+        github_user_id=654321,
+        github_login="other-attacker",
+        display_name="Other User",
+    )
+    db_session.add(user)
+    db_session.commit()
+    return user
+
+
+@pytest.fixture
+def other_project(db_session: Session, other_user: User) -> Project:
+    """Project owned by second user for cross-tenant isolation testing."""
+    project = Project(
+        owner_user_id=other_user.id,
+        kind="manual",
+        name="Other Project",
+        status="active",
+    )
+    db_session.add(project)
+    db_session.commit()
+    return project
+
+
+def create_authenticated_user_session(db_session: Session, user: User) -> str:
+    """Helper to create a server-side session and return raw token for Bearer auth."""
+    raw_token = f"test-token-{uuid.uuid4().hex}-{user.id}"
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).digest()
+    user_session = UserSession(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=utc_now() + timedelta(days=1),
+    )
+    db_session.add(user_session)
+    db_session.commit()
+    return raw_token
+
+
+@pytest.fixture
+def client(
+    session_factory: sessionmaker[Session],
+    db_session: Session,
+    sample_user: User,
+) -> Generator[TestClient, None, None]:
+    """TestClient authenticated as sample_user via real UserSession token."""
+    token = create_authenticated_user_session(db_session, sample_user)
 
     def override_get_db_session() -> Generator[Session, None, None]:
         with session_scope(session_factory) as session:
             yield session
 
-    def override_get_settings() -> Settings:
-        return Settings(
-            APP_ENV="test",
-            ENABLE_DEV_UNAUTHENTICATED_SCANS=True,
-        )
+    app.dependency_overrides[get_db_session] = override_get_db_session
+    with TestClient(app, headers={"Authorization": f"Bearer {token}"}) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def other_client(
+    session_factory: sessionmaker[Session],
+    db_session: Session,
+    other_user: User,
+) -> Generator[TestClient, None, None]:
+    """TestClient authenticated as other_user via real UserSession token."""
+    token = create_authenticated_user_session(db_session, other_user)
+
+    def override_get_db_session() -> Generator[Session, None, None]:
+        with session_scope(session_factory) as session:
+            yield session
 
     app.dependency_overrides[get_db_session] = override_get_db_session
-    app.dependency_overrides[get_settings] = override_get_settings
-    with TestClient(app) as test_client:
+    with TestClient(app, headers={"Authorization": f"Bearer {token}"}) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
@@ -146,14 +207,7 @@ def unauthenticated_client(
         with session_scope(session_factory) as session:
             yield session
 
-    def override_get_settings() -> Settings:
-        return Settings(
-            APP_ENV="test",
-            ENABLE_DEV_UNAUTHENTICATED_SCANS=False,
-        )
-
     app.dependency_overrides[get_db_session] = override_get_db_session
-    app.dependency_overrides[get_settings] = override_get_settings
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -726,6 +780,29 @@ class TestFastAPIEndpoints:
         assert response.status_code == 401
         assert "Authentication required" in response.json()["detail"]
 
+    def test_post_manual_scan_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """POST /projects/{id}/scans/manual without authentication fails closed with 401 Unauthorized."""
+        payload = {"files": [{"path": "main.py", "content": "x = 1"}]}
+        # Versioned route
+        response = unauthenticated_client.post(
+            f"/api/v1/projects/{sample_project.id}/scans/manual",
+            json=payload,
+        )
+        assert response.status_code == 401
+        assert "Authentication required" in response.json()["detail"]
+
+        # Root-level route alias
+        root_response = unauthenticated_client.post(
+            f"/projects/{sample_project.id}/scans/manual",
+            json=payload,
+        )
+        assert root_response.status_code == 401
+        assert "Authentication required" in root_response.json()["detail"]
+
     def test_post_manual_scan_production_fails_closed(
         self,
         production_client: TestClient,
@@ -834,7 +911,7 @@ class TestFastAPIEndpoints:
             json=payload,
         )
         assert response.status_code == 404
-        assert "does not exist" in response.json()["detail"]
+        assert "not found" in response.json()["detail"].lower()
 
     def test_post_manual_scan_payload_too_large_413(
         self,
@@ -941,3 +1018,125 @@ class TestFastAPIEndpoints:
         )
         assert conflict_resp.status_code == 409
         assert secret_token not in conflict_resp.text
+
+    def test_get_scan_unauthenticated_fails_closed_401(
+        self,
+        unauthenticated_client: TestClient,
+        sample_project: Project,
+        db_session: Session,
+    ) -> None:
+        """GET /scans/{id} without authentication fails closed with 401 Unauthorized."""
+        scan, _ = create_manual_scan(
+            db_session,
+            project_id=sample_project.id,
+            files=[ManualFileInput(path="src/main.py", content="x = 1")],
+            auto_commit=True,
+        )
+        response = unauthenticated_client.get(f"/api/v1/scans/{scan.id}")
+        assert response.status_code == 401
+        assert "Authentication required" in response.json()["detail"]
+
+    def test_get_scan_cross_tenant_isolation_returns_404(
+        self,
+        client: TestClient,
+        other_client: TestClient,
+        sample_project: Project,
+        other_project: Project,
+        db_session: Session,
+    ) -> None:
+        """User B cannot retrieve User A's scan and receives 404 Not Found."""
+        alice_scan, _ = create_manual_scan(
+            db_session,
+            project_id=sample_project.id,
+            files=[ManualFileInput(path="src/alice.py", content="a = 1")],
+            auto_commit=True,
+        )
+        bob_scan, _ = create_manual_scan(
+            db_session,
+            project_id=other_project.id,
+            files=[ManualFileInput(path="src/bob.py", content="b = 2")],
+            auto_commit=True,
+        )
+
+        # User A can retrieve own scan
+        r_alice = client.get(f"/api/v1/scans/{alice_scan.id}")
+        assert r_alice.status_code == 200
+        assert r_alice.json()["id"] == str(alice_scan.id)
+
+        # User B cannot retrieve User A's scan -> 404
+        r_bob_alice = other_client.get(f"/api/v1/scans/{alice_scan.id}")
+        assert r_bob_alice.status_code == 404
+        assert f"Scan with ID '{alice_scan.id}' not found" in r_bob_alice.json()["detail"]
+
+        # User A cannot retrieve User B's scan -> 404
+        r_alice_bob = client.get(f"/api/v1/scans/{bob_scan.id}")
+        assert r_alice_bob.status_code == 404
+        assert f"Scan with ID '{bob_scan.id}' not found" in r_alice_bob.json()["detail"]
+
+    def test_post_manual_scan_cross_tenant_isolation_returns_404(
+        self,
+        other_client: TestClient,
+        sample_project: Project,
+    ) -> None:
+        """User B cannot submit a manual scan to User A's project and receives 404 Not Found."""
+        payload = {"files": [{"path": "src/exploit.py", "content": "attack = True"}]}
+        response = other_client.post(
+            f"/api/v1/projects/{sample_project.id}/scans/manual",
+            json=payload,
+        )
+        assert response.status_code == 404
+        assert f"Project with ID '{sample_project.id}' not found" in response.json()["detail"]
+
+    def test_post_manual_scan_records_authenticated_user_id(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        sample_user: User,
+        db_session: Session,
+    ) -> None:
+        """Successful scan creation stores the authenticated user's ID in created_by_user_id."""
+        payload = {"files": [{"path": "src/feature.py", "content": "data = 123"}]}
+        response = client.post(
+            f"/api/v1/projects/{sample_project.id}/scans/manual",
+            json=payload,
+        )
+        assert response.status_code == 202
+        scan_id = uuid.UUID(response.json()["id"])
+
+        db_session.expire_all()
+        scan = db_session.get(Scan, scan_id)
+        assert scan is not None
+        assert scan.created_by_user_id == sample_user.id
+
+    def test_post_manual_scan_soft_deleted_project_returns_404(
+        self,
+        client: TestClient,
+        sample_project: Project,
+        db_session: Session,
+    ) -> None:
+        """Soft-deleted project fails closed with 404 Not Found for scan submission and retrieval."""
+        # 1. Create a scan while project is active
+        scan, _ = create_manual_scan(
+            db_session,
+            project_id=sample_project.id,
+            files=[ManualFileInput(path="src/feature.py", content="data = 123")],
+            auto_commit=True,
+        )
+
+        # 2. Mark the project soft-deleted and commit
+        sample_project.deleted_at = utc_now()
+        db_session.commit()
+
+        # 3. Verify POST scan submission returns 404 with project-not-found detail
+        payload = {"files": [{"path": "src/feature.py", "content": "data = 123"}]}
+        response = client.post(
+            f"/api/v1/projects/{sample_project.id}/scans/manual",
+            json=payload,
+        )
+        assert response.status_code == 404
+        assert f"Project with ID '{sample_project.id}' not found" in response.json()["detail"]
+
+        # 4. Verify GET scan retrieval returns 404 with generic scan-not-found detail
+        get_response = client.get(f"/api/v1/scans/{scan.id}")
+        assert get_response.status_code == 404
+        assert f"Scan with ID '{scan.id}' not found" in get_response.json()["detail"]
