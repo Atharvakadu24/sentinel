@@ -29,6 +29,7 @@ from app.services.job_service import (
     retry_job,
     sanitize_failure_message,
 )
+from app.services.project_service import list_projects
 from app.services.scan_service import (
     ProjectNotFoundError,
     ScanConflictError,
@@ -76,6 +77,7 @@ __all__ = [
     "get_scan",
     "is_extension_supported",
     "is_minified_or_generated",
+    "list_projects",
     "list_scan_findings",
     "list_scan_findings_paginated",
     "persist_scan_findings",
