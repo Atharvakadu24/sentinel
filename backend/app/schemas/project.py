@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -86,3 +86,31 @@ class PaginatedProjectsResponse(BaseModel):
 
 
 ProjectListResponse = PaginatedProjectsResponse
+
+
+class ProjectDetailResponse(ProjectListItem):
+    """Full details of a project, including configuration settings."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    settings: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional project-level scan settings and configuration.",
+    )
+
+    @classmethod
+    def from_orm_model(cls, project: Project) -> ProjectDetailResponse:
+        """Construct ProjectDetailResponse from an ORM Project instance."""
+        return cls(
+            id=project.id,
+            name=project.name,
+            kind=ProjectKind(project.kind),
+            status=ProjectStatus(project.status),
+            installation_id=project.installation_id,
+            github_repo_id=project.github_repo_id,
+            full_name=project.full_name,
+            default_branch=project.default_branch,
+            settings=project.settings,
+            created_at=project.created_at,
+            updated_at=project.updated_at,
+        )

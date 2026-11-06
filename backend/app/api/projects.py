@@ -3,17 +3,20 @@
 Implements Blueprint Section 8.1 (Projects API contracts) and Section 12
 (Threat Mitigation T4: Tenant Isolation).
 - GET /projects: List projects owned by the authenticated user with filters & pagination (200 OK)
+- GET /projects/{project_id}: Get project details and configuration settings (200 OK)
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, verify_project_access
+from app.db.models.project import Project
 from app.schemas.project import (
     PaginatedProjectsResponse,
+    ProjectDetailResponse,
     ProjectKind,
     ProjectListItem,
     ProjectStatus,
@@ -77,3 +80,16 @@ def list_projects_endpoint(
         offset=offset,
     )
 
+
+@router.get(
+    "/projects/{project_id}",
+    response_model=ProjectDetailResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get project details",
+    description="Retrieve full project details and settings for a project owned by the authenticated user.",
+)
+def get_project_endpoint(
+    project: Annotated[Project, Depends(verify_project_access)],
+) -> ProjectDetailResponse:
+    """Retrieve full project details by ID for the authenticated owner."""
+    return ProjectDetailResponse.from_orm_model(project)

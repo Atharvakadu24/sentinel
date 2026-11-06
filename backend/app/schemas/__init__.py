@@ -2,6 +2,7 @@
 
 from app.schemas.project import (
     PaginatedProjectsResponse,
+    ProjectDetailResponse,
     ProjectKind,
     ProjectListItem,
     ProjectListResponse,
@@ -28,6 +29,7 @@ __all__ = [
     "ManualScanCreateRequest",
     "PaginatedProjectsResponse",
     "PaginatedScansResponse",
+    "ProjectDetailResponse",
     "ProjectKind",
     "ProjectListItem",
     "ProjectListResponse",

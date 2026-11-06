@@ -477,3 +477,212 @@ class TestListProjectsEndpoint:
         assert resp_v1.status_code == 200
         assert resp_root.json() == resp_v1.json()
 
+
+class TestGetProjectEndpoint:
+    """Integration and security tests for GET /projects/{project_id} and GET /api/v1/projects/{project_id}."""
+
+    def test_get_project_manual_owner_success(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Authenticated owner can retrieve a manual project, including its settings."""
+        settings_payload = {
+            "scan_depth": "deep",
+            "ignore_paths": ["vendor/", "node_modules/"],
+            "features": {"ai_summaries": True},
+        }
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="Manual Analysis Service",
+            status="active",
+            default_branch="develop",
+            settings=settings_payload,
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = client.get(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["id"] == str(project.id)
+        assert data["name"] == "Manual Analysis Service"
+        assert data["kind"] == "manual"
+        assert data["status"] == "active"
+        assert data["installation_id"] is None
+        assert data["github_repo_id"] is None
+        assert data["full_name"] is None
+        assert data["default_branch"] == "develop"
+        assert data["settings"] == settings_payload
+        assert "created_at" in data
+        assert "updated_at" in data
+
+        # Strict response validation: verify no extra or ORM internal keys leaked
+        expected_keys = {
+            "id",
+            "name",
+            "kind",
+            "status",
+            "installation_id",
+            "github_repo_id",
+            "full_name",
+            "default_branch",
+            "settings",
+            "created_at",
+            "updated_at",
+        }
+        assert set(data.keys()) == expected_keys
+
+    def test_get_project_github_metadata_success(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Authenticated owner can retrieve a GitHub project and its GitHub metadata."""
+        installation = GitHubInstallation(
+            installation_id=554433,
+            owner_user_id=sample_user.id,
+            account_login="sentinel-org",
+            account_type="Organization",
+            status="active",
+        )
+        db_session.add(installation)
+        db_session.commit()
+
+        settings_payload = {"notifications": True, "branch_protection": "strict"}
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="github",
+            name="sentinel-core",
+            installation_id=installation.id,
+            github_repo_id=987654321,
+            full_name="sentinel-org/sentinel-core",
+            default_branch="main",
+            status="active",
+            settings=settings_payload,
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = client.get(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["id"] == str(project.id)
+        assert data["name"] == "sentinel-core"
+        assert data["kind"] == "github"
+        assert data["status"] == "active"
+        assert data["installation_id"] == str(installation.id)
+        assert data["github_repo_id"] == 987654321
+        assert data["full_name"] == "sentinel-org/sentinel-core"
+        assert data["default_branch"] == "main"
+        assert data["settings"] == settings_payload
+
+    def test_get_project_nonexistent_uuid_returns_404(
+        self,
+        client: TestClient,
+    ) -> None:
+        """A nonexistent UUID returns generic HTTP 404."""
+        nonexistent_id = uuid.uuid4()
+        resp = client.get(f"/api/v1/projects/{nonexistent_id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{nonexistent_id}' not found"
+
+    def test_get_project_cross_tenant_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        other_user: User,
+    ) -> None:
+        """Querying another tenant's project returns generic HTTP 404 (Threat T4 mitigation)."""
+        other_project = Project(
+            owner_user_id=other_user.id,
+            kind="manual",
+            name="Secret Tenant Project",
+            status="active",
+        )
+        db_session.add(other_project)
+        db_session.commit()
+
+        # sample_user attempts to access other_user's project
+        resp = client.get(f"/api/v1/projects/{other_project.id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{other_project.id}' not found"
+
+    def test_get_project_soft_deleted_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """A soft-deleted project owned by the caller returns generic HTTP 404."""
+        deleted_project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="Deleted Project",
+            status="active",
+            deleted_at=utc_now(),
+        )
+        db_session.add(deleted_project)
+        db_session.commit()
+
+        resp = client.get(f"/api/v1/projects/{deleted_project.id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{deleted_project.id}' not found"
+
+    def test_get_project_malformed_uuid_returns_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """A malformed UUID in the path returns HTTP 422 Unprocessable Entity."""
+        assert client.get("/api/v1/projects/not-a-valid-uuid").status_code == 422
+        assert client.get("/api/v1/projects/12345").status_code == 422
+        assert client.get("/api/v1/projects/0000-invalid").status_code == 422
+
+    def test_get_project_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """An unauthenticated request returns HTTP 401 Unauthorized."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="Protected Project",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = unauthenticated_client.get(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Authentication required"
+
+    def test_get_project_root_and_v1_routes_equivalent(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Root (/projects/{id}) and versioned (/api/v1/projects/{id}) routes return identical payloads."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="Dual Route Detail Project",
+            status="active",
+            settings={"mode": "standard"},
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp_root = client.get(f"/projects/{project.id}")
+        resp_v1 = client.get(f"/api/v1/projects/{project.id}")
+
+        assert resp_root.status_code == 200
+        assert resp_v1.status_code == 200
+        assert resp_root.json() == resp_v1.json()
