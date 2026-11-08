@@ -29,7 +29,13 @@ from app.services.job_service import (
     retry_job,
     sanitize_failure_message,
 )
-from app.services.project_service import list_projects
+from app.services.project_service import (
+    ProjectConflictError,
+    ProjectServiceError,
+    ProjectValidationError,
+    create_manual_project,
+    list_projects,
+)
 from app.services.scan_service import (
     ProjectNotFoundError,
     ScanConflictError,
@@ -60,8 +66,11 @@ __all__ = [
     "JobServiceError",
     "JobTransitionError",
     "PersistedFindingsResult",
+    "ProjectConflictError",
     "ProjectMismatchError",
     "ProjectNotFoundError",
+    "ProjectServiceError",
+    "ProjectValidationError",
     "ScanConflictError",
     "ScanNotFoundError",
     "ScanPayloadTooLargeError",
@@ -70,6 +79,7 @@ __all__ = [
     "UserNotFoundError",
     "claim_next_job",
     "complete_job",
+    "create_manual_project",
     "create_manual_scan",
     "create_scan_and_job",
     "fail_job",

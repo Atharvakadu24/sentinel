@@ -13,11 +13,13 @@ import uuid
 from collections.abc import Generator
 from datetime import timedelta
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -686,3 +688,384 @@ class TestGetProjectEndpoint:
         assert resp_root.status_code == 200
         assert resp_v1.status_code == 200
         assert resp_root.json() == resp_v1.json()
+
+
+class TestCreateProjectEndpoint:
+    """Integration and security tests for POST /projects and POST /api/v1/projects."""
+
+    def test_create_manual_project_success(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Authenticated owner can create a manual project with full fields."""
+        payload = {
+            "name": "payments-backend",
+            "default_branch": "develop",
+            "settings": {"scan_depth": "deep", "ignore_paths": ["vendor/"]},
+        }
+        resp = client.post("/api/v1/projects", json=payload)
+        assert resp.status_code == 201
+        data = resp.json()
+
+        assert data["name"] == "payments-backend"
+        assert data["kind"] == "manual"
+        assert data["status"] == "active"
+        assert data["installation_id"] is None
+        assert data["github_repo_id"] is None
+        assert data["full_name"] is None
+        assert data["default_branch"] == "develop"
+        assert data["settings"] == {"scan_depth": "deep", "ignore_paths": ["vendor/"]}
+        assert "id" in data
+        assert "created_at" in data
+        assert "updated_at" in data
+
+        # Verify DB persistence and tenant binding
+        proj_id = uuid.UUID(data["id"])
+        db_project = db_session.get(Project, proj_id)
+        assert db_project is not None
+        assert db_project.owner_user_id == sample_user.id
+        assert db_project.name == "payments-backend"
+        assert db_project.kind == "manual"
+        assert db_project.status == "active"
+        assert db_project.deleted_at is None
+
+    def test_create_manual_project_defaults(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Omitting optional fields applies correct defaults."""
+        resp = client.post("/api/v1/projects", json={"name": "minimal-project"})
+        assert resp.status_code == 201
+        data = resp.json()
+
+        assert data["name"] == "minimal-project"
+        assert data["kind"] == "manual"
+        assert data["status"] == "active"
+        assert data["default_branch"] == "main"
+        assert data["settings"] is None
+
+    def test_create_manual_project_explicit_kind_manual(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Explicitly providing kind='manual' is accepted."""
+        resp = client.post("/api/v1/projects", json={"name": "explicit-kind", "kind": "manual"})
+        assert resp.status_code == 201
+        assert resp.json()["kind"] == "manual"
+
+    def test_create_manual_project_duplicate_name_conflict_409(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Attempting to create a duplicate project name for the same owner returns HTTP 409."""
+        client.post("/api/v1/projects", json={"name": "inventory-api"})
+
+        resp = client.post("/api/v1/projects", json={"name": "inventory-api"})
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["detail"]
+
+    def test_create_manual_project_case_insensitive_duplicate_conflict_409(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Duplicate detection is case-insensitive within the same tenant."""
+        client.post("/api/v1/projects", json={"name": "audit-service"})
+
+        resp = client.post("/api/v1/projects", json={"name": "AUDIT-SERVICE"})
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["detail"]
+
+    def test_create_manual_project_same_name_different_tenants_allowed(
+        self,
+        client: TestClient,
+        other_client: TestClient,
+        db_session: Session,
+        sample_user: User,
+        other_user: User,
+    ) -> None:
+        """Different tenants can create projects with the same name without collision."""
+        resp1 = client.post("/api/v1/projects", json={"name": "shared-service"})
+        assert resp1.status_code == 201
+
+        resp2 = other_client.post("/api/v1/projects", json={"name": "shared-service"})
+        assert resp2.status_code == 201
+
+        p1_id = uuid.UUID(resp1.json()["id"])
+        p2_id = uuid.UUID(resp2.json()["id"])
+        assert p1_id != p2_id
+
+        p1 = db_session.get(Project, p1_id)
+        p2 = db_session.get(Project, p2_id)
+        assert p1 is not None and p1.owner_user_id == sample_user.id
+        assert p2 is not None and p2.owner_user_id == other_user.id
+
+    def test_create_manual_project_soft_deleted_name_reuse_allowed(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """A user can reuse a project name if previous project was soft-deleted."""
+        deleted_proj = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="reusable-name",
+            status="active",
+            deleted_at=utc_now(),
+        )
+        db_session.add(deleted_proj)
+        db_session.commit()
+
+        resp = client.post("/api/v1/projects", json={"name": "reusable-name"})
+        assert resp.status_code == 201
+        assert resp.json()["name"] == "reusable-name"
+        assert uuid.UUID(resp.json()["id"]) != deleted_proj.id
+
+    def test_create_manual_project_spoofed_owner_user_id_rejected_422(
+        self,
+        client: TestClient,
+        other_user: User,
+    ) -> None:
+        """Attempting to supply owner_user_id in request payload is rejected with HTTP 422."""
+        payload = {
+            "name": "spoofed-project",
+            "owner_user_id": str(other_user.id),
+        }
+        resp = client.post("/api/v1/projects", json=payload)
+        assert resp.status_code == 422
+
+    def test_create_manual_project_github_kind_and_fields_rejected_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """GitHub kind or GitHub-specific fields are strictly rejected with HTTP 422."""
+        # Reject kind="github"
+        resp1 = client.post("/api/v1/projects", json={"name": "gh1", "kind": "github"})
+        assert resp1.status_code == 422
+
+        # Reject installation_id
+        resp2 = client.post(
+            "/api/v1/projects",
+            json={"name": "gh2", "installation_id": str(uuid.uuid4())},
+        )
+        assert resp2.status_code == 422
+
+        # Reject github_repo_id
+        resp3 = client.post("/api/v1/projects", json={"name": "gh3", "github_repo_id": 12345})
+        assert resp3.status_code == 422
+
+        # Reject full_name
+        resp4 = client.post("/api/v1/projects", json={"name": "gh4", "full_name": "owner/repo"})
+        assert resp4.status_code == 422
+
+        # Reject status override
+        resp5 = client.post("/api/v1/projects", json={"name": "gh5", "status": "archived"})
+        assert resp5.status_code == 422
+
+        # Reject client-supplied ID
+        resp6 = client.post("/api/v1/projects", json={"name": "gh6", "id": str(uuid.uuid4())})
+        assert resp6.status_code == 422
+
+    def test_create_manual_project_invalid_names_and_branches_rejected_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Invalid names or branch formats fail validation with HTTP 422."""
+        # Empty name
+        assert client.post("/api/v1/projects", json={"name": ""}).status_code == 422
+
+        # Whitespace-only name
+        assert client.post("/api/v1/projects", json={"name": "   "}).status_code == 422
+
+        # Name too long (> 100 chars)
+        assert client.post("/api/v1/projects", json={"name": "a" * 101}).status_code == 422
+
+        # Name with newline or control character
+        assert client.post("/api/v1/projects", json={"name": "bad\nproject"}).status_code == 422
+        assert client.post("/api/v1/projects", json={"name": "bad\rproject"}).status_code == 422
+
+        # Branch with spaces
+        assert (
+            client.post(
+                "/api/v1/projects",
+                json={"name": "good-name", "default_branch": "my branch"},
+            ).status_code
+            == 422
+        )
+
+        # Branch too long (> 100 chars)
+        assert (
+            client.post(
+                "/api/v1/projects",
+                json={"name": "good-name", "default_branch": "b" * 101},
+            ).status_code
+            == 422
+        )
+
+    def test_create_manual_project_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+    ) -> None:
+        """Unauthenticated requests fail with HTTP 401."""
+        resp = unauthenticated_client.post("/api/v1/projects", json={"name": "unauthed"})
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Authentication required"
+
+    def test_create_manual_project_root_and_v1_routes_parity(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Both /projects and /api/v1/projects successfully create projects."""
+        r1 = client.post("/projects", json={"name": "root-created"})
+        r2 = client.post("/api/v1/projects", json={"name": "v1-created"})
+
+        assert r1.status_code == 201
+        assert r2.status_code == 201
+        assert r1.json()["name"] == "root-created"
+        assert r2.json()["name"] == "v1-created"
+
+    def test_create_manual_project_owner_user_id_always_derived_from_user(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """The created project is guaranteed to be owned by CurrentUser."""
+        resp = client.post("/api/v1/projects", json={"name": "tenant-bound"})
+        assert resp.status_code == 201
+        project_id = uuid.UUID(resp.json()["id"])
+
+        db_proj = db_session.get(Project, project_id)
+        assert db_proj is not None
+        assert db_proj.owner_user_id == sample_user.id
+
+    def test_create_manual_project_unrelated_integrity_error_mapped_to_500(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Unrelated integrity error (e.g. unexpected column) maps to HTTP 500 without leaking details."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("NOT NULL constraint failed: projects.unexpected_internal_col"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "error-test"})
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "An internal error occurred while creating the project."
+
+    def test_create_manual_project_fk_integrity_error_mapped_to_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Foreign key integrity error maps to HTTP 422 with validation error."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("FOREIGN KEY constraint failed"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "fk-error-test"})
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Referenced user does not exist."
+
+    def test_create_manual_project_check_constraint_integrity_error_mapped_to_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Known check constraint integrity error maps to HTTP 422."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("CHECK constraint failed: ck_projects_kind"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "check-error-test"})
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Project data violates database integrity constraints."
+
+    def test_create_manual_project_name_unique_integrity_error_mapped_to_409(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Project name unique constraint integrity error maps to HTTP 409."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("UNIQUE constraint failed: projects.name"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "unique-error-test"})
+
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["detail"]
+
+    def test_create_manual_project_unrelated_integrity_error_mapped_to_500(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Unrelated integrity error (e.g. unexpected column) maps to HTTP 500 without leaking details."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("NOT NULL constraint failed: projects.unexpected_internal_col"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "error-test"})
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "An internal error occurred while creating the project."
+
+    def test_create_manual_project_fk_integrity_error_mapped_to_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Foreign key integrity error maps to HTTP 422 with validation error."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("FOREIGN KEY constraint failed"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "fk-error-test"})
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Referenced user does not exist."
+
+    def test_create_manual_project_check_constraint_integrity_error_mapped_to_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Known check constraint integrity error maps to HTTP 422."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("CHECK constraint failed: ck_projects_kind"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "check-error-test"})
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Project data violates database integrity constraints."
+
+    def test_create_manual_project_name_unique_integrity_error_mapped_to_409(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Project name unique constraint integrity error maps to HTTP 409."""
+        simulated_exc = IntegrityError(
+            statement="INSERT INTO projects ...",
+            params={},
+            orig=Exception("UNIQUE constraint failed: projects.name"),
+        )
+        with patch.object(Session, "flush", side_effect=simulated_exc):
+            resp = client.post("/api/v1/projects", json={"name": "unique-error-test"})
+
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["detail"]
+

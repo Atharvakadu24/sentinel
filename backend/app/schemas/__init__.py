@@ -1,6 +1,7 @@
 """Pydantic schemas for API request and response validation."""
 
 from app.schemas.project import (
+    ManualProjectCreateRequest,
     PaginatedProjectsResponse,
     ProjectDetailResponse,
     ProjectKind,
@@ -26,6 +27,7 @@ from app.schemas.scan import (
 __all__ = [
     "FileSummaryItem",
     "ManualFileInput",
+    "ManualProjectCreateRequest",
     "ManualScanCreateRequest",
     "PaginatedProjectsResponse",
     "PaginatedScansResponse",

@@ -10,9 +10,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 if TYPE_CHECKING:
     from app.db.models.project import Project
@@ -114,3 +114,57 @@ class ProjectDetailResponse(ProjectListItem):
             created_at=project.created_at,
             updated_at=project.updated_at,
         )
+
+
+class ManualProjectCreateRequest(BaseModel):
+    """Request payload for manual project creation (Section 9.2)."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Display name of the manual project.",
+        examples=["backend-service"],
+    )
+    kind: Literal["manual"] | None = Field(
+        default="manual",
+        description="Project kind. Must be 'manual' if provided.",
+    )
+    default_branch: str | None = Field(
+        default="main",
+        min_length=1,
+        max_length=100,
+        description="Default branch for scan references (defaults to 'main').",
+        examples=["main"],
+    )
+    settings: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional project configuration and scan exclusion settings.",
+        examples=[{"ignore_paths": ["vendor/", "dist/"]}],
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("Project name cannot be empty or whitespace only.")
+        if any(c in trimmed for c in "\r\n\t\0"):
+            raise ValueError(
+                "Project name cannot contain newline, carriage return, tab, or null characters."
+            )
+        return trimmed
+
+    @field_validator("default_branch")
+    @classmethod
+    def validate_default_branch(cls, v: str | None) -> str | None:
+        if v is None:
+            return "main"
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("Default branch cannot be empty or whitespace only.")
+        if any(c.isspace() or c == "\0" for c in trimmed):
+            raise ValueError("Default branch cannot contain whitespace or null characters.")
+        return trimmed
