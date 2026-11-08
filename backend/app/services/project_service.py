@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.db.base import utc_now
 from app.db.models.project import Project
 from app.db.models.user import User
 from app.schemas.project import ProjectKind, ProjectStatus
@@ -201,5 +202,100 @@ def create_manual_project(
     except Exception as exc:
         session.rollback()
         raise ProjectServiceError("Unexpected error creating project.") from exc
+
+    return project
+
+
+def update_project(
+    session: Session,
+    *,
+    project: Project,
+    name: str | None = None,
+    default_branch: str | None = None,
+    settings: dict[str, Any] | None = None,
+    fields_set: set[str] | None = None,
+    auto_commit: bool = False,
+) -> Project:
+    """Update supported fields of an existing project.
+
+    Enforces:
+    - Supported field updates: name, default_branch, settings.
+    - Tenant-scoped, case-insensitive duplicate name conflict: if name is updated,
+      verifies that no other active project owned by the same user shares the name.
+    - Preserves protected fields: id, owner_user_id, kind, status, installation_id,
+      github_repo_id, full_name, deleted_at are never altered.
+    - Concurrency safety: serializes same-tenant mutations on PostgreSQL using row locks.
+    - Safe IntegrityError handling with rollback and domain error mapping.
+    """
+    effective_fields = fields_set if fields_set is not None else set()
+    changed = False
+
+    # 1. Update project name if provided in fields_set
+    if "name" in effective_fields and name is not None:
+        cleaned_name = name.strip()
+        if not cleaned_name:
+            raise ProjectValidationError("Project name cannot be empty or whitespace only.")
+
+        # On PostgreSQL, serialize same-tenant mutations using a row-level lock on User
+        user_stmt = select(User.id).where(User.id == project.owner_user_id)
+        bind = session.get_bind()
+        if bind is not None and getattr(bind.dialect, "name", "") == "postgresql":
+            user_stmt = user_stmt.with_for_update()
+        session.scalar(user_stmt)
+
+        # Check for case-insensitive name conflict against other active projects of this owner
+        dup_stmt = select(Project.id).where(
+            Project.owner_user_id == project.owner_user_id,
+            Project.id != project.id,
+            Project.deleted_at.is_(None),
+            sa.func.lower(Project.name) == sa.func.lower(cleaned_name),
+        )
+        if session.scalar(dup_stmt) is not None:
+            raise ProjectConflictError(
+                f"An active project with the name '{cleaned_name}' already exists."
+            )
+
+        if project.name != cleaned_name:
+            project.name = cleaned_name
+            changed = True
+
+    # 2. Update default_branch if provided in fields_set
+    if "default_branch" in effective_fields and default_branch is not None:
+        cleaned_branch = default_branch.strip()
+        if not cleaned_branch:
+            raise ProjectValidationError("Default branch cannot be empty or whitespace only.")
+        if project.default_branch != cleaned_branch:
+            project.default_branch = cleaned_branch
+            changed = True
+
+    # 3. Update settings if provided in fields_set (explicit None clears settings)
+    if "settings" in effective_fields and project.settings != settings:
+        project.settings = settings
+        changed = True
+
+    if changed:
+        project.updated_at = utc_now()
+
+    try:
+        session.flush()
+        if auto_commit:
+            session.commit()
+            session.refresh(project)
+    except IntegrityError as exc:
+        session.rollback()
+        if _is_project_name_conflict(exc):
+            raise ProjectConflictError(
+                f"An active project with the name '{project.name}' already exists."
+            ) from exc
+        if _is_project_check_violation(exc):
+            raise ProjectValidationError(
+                "Project data violates database integrity constraints."
+            ) from exc
+        if _is_foreign_key_violation(exc):
+            raise ProjectValidationError("Referenced user does not exist.") from exc
+        raise ProjectServiceError("Database integrity error updating project.") from exc
+    except Exception as exc:
+        session.rollback()
+        raise ProjectServiceError("Unexpected error updating project.") from exc
 
     return project

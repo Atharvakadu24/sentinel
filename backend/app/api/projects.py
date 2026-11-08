@@ -5,6 +5,7 @@ Implements Blueprint Section 8.1 (Projects API contracts) and Section 12
 - GET /projects: List projects owned by the authenticated user with filters & pagination (200 OK)
 - GET /projects/{project_id}: Get project details and configuration settings (200 OK)
 - POST /projects: Create a new manual project for the authenticated user (201 Created)
+- PATCH /projects/{project_id}: Update supported fields of an existing project (200 OK)
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from app.schemas.project import (
     ProjectKind,
     ProjectListItem,
     ProjectStatus,
+    ProjectUpdateRequest,
 )
 from app.services.project_service import (
     ProjectConflictError,
@@ -29,6 +31,7 @@ from app.services.project_service import (
     ProjectValidationError,
     create_manual_project,
     list_projects,
+    update_project,
 )
 
 router = APIRouter(tags=["projects"])
@@ -141,3 +144,44 @@ def create_project_endpoint(
         ) from exc
 
     return ProjectDetailResponse.from_orm_model(project)
+
+
+@router.patch(
+    "/projects/{project_id}",
+    response_model=ProjectDetailResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update project",
+    description="Update supported fields of an existing project owned by the authenticated user.",
+)
+def update_project_endpoint(
+    project: Annotated[Project, Depends(verify_project_access)],
+    body: ProjectUpdateRequest,
+    session: DbSession,
+) -> ProjectDetailResponse:
+    """Update supported fields of an existing project for the authenticated owner."""
+    try:
+        updated = update_project(
+            session,
+            project=project,
+            name=body.name,
+            default_branch=body.default_branch,
+            settings=body.settings,
+            fields_set=body.model_fields_set,
+        )
+    except ProjectConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ProjectValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    except ProjectServiceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while updating the project.",
+        ) from exc
+
+    return ProjectDetailResponse.from_orm_model(updated)

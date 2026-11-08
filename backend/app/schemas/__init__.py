@@ -8,6 +8,7 @@ from app.schemas.project import (
     ProjectListItem,
     ProjectListResponse,
     ProjectStatus,
+    ProjectUpdateRequest,
 )
 from app.schemas.scan import (
     FileSummaryItem,
@@ -36,6 +37,7 @@ __all__ = [
     "ProjectListItem",
     "ProjectListResponse",
     "ProjectStatus",
+    "ProjectUpdateRequest",
     "ScanCreateResponse",
     "ScanDetailResponse",
     "ScanErrorDetail",

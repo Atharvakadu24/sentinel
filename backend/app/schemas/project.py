@@ -168,3 +168,55 @@ class ManualProjectCreateRequest(BaseModel):
         if any(c.isspace() or c == "\0" for c in trimmed):
             raise ValueError("Default branch cannot contain whitespace or null characters.")
         return trimmed
+
+
+class ProjectUpdateRequest(BaseModel):
+    """Request payload for updating an existing project (PATCH /projects/{id})."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Updated project display name.",
+        examples=["new-project-name"],
+    )
+    default_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Updated default Git branch (e.g., 'main').",
+        examples=["main"],
+    )
+    settings: dict[str, Any] | None = Field(
+        default=None,
+        description="Updated project configuration settings (explicit null clears settings).",
+        examples=[{"ignore_paths": ["vendor/"]}],
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str | None) -> str | None:
+        if v is None:
+            raise ValueError("Project name cannot be null.")
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("Project name cannot be empty or whitespace only.")
+        if any(c in trimmed for c in "\r\n\t\0"):
+            raise ValueError(
+                "Project name cannot contain newline, carriage return, tab, or null characters."
+            )
+        return trimmed
+
+    @field_validator("default_branch")
+    @classmethod
+    def validate_default_branch(cls, v: str | None) -> str | None:
+        if v is None:
+            raise ValueError("Default branch cannot be null.")
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("Default branch cannot be empty or whitespace only.")
+        if any(c.isspace() or c == "\0" for c in trimmed):
+            raise ValueError("Default branch cannot contain whitespace or null characters.")
+        return trimmed

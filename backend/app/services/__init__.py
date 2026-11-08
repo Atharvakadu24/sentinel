@@ -35,6 +35,7 @@ from app.services.project_service import (
     ProjectValidationError,
     create_manual_project,
     list_projects,
+    update_project,
 )
 from app.services.scan_service import (
     ProjectNotFoundError,
@@ -95,5 +96,6 @@ __all__ = [
     "renew_job_lease",
     "retry_job",
     "sanitize_failure_message",
+    "update_project",
     "validate_manual_scan_files",
 ]
