@@ -25,13 +25,13 @@ DbSession = Annotated[Session, Depends(get_db_session)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 
 
-def get_current_user(
+def get_current_session(
     session: DbSession,
     settings: AppSettings,
     sentinel_session: Annotated[str | None, Cookie()] = None,
     authorization: Annotated[str | None, Header()] = None,
-) -> User:
-    """Resolve authenticated User from session cookie or Bearer token.
+) -> UserSession:
+    """Resolve authenticated UserSession from session cookie or Bearer token.
 
     Blueprint Section 4 & Section 12 (Threat T17):
     - Server-side user session verified by SHA-256 token digest.
@@ -64,12 +64,22 @@ def get_current_user(
             and user_session.user.deleted_at is None
         ):
             user_session.last_used_at = now
-            return user_session.user
+            return user_session
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Authentication required",
     )
+
+
+CurrentSession = Annotated[UserSession, Depends(get_current_session)]
+
+
+def get_current_user(
+    current_session: CurrentSession,
+) -> User:
+    """Resolve authenticated User from active UserSession."""
+    return current_session.user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

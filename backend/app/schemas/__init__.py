@@ -24,6 +24,7 @@ from app.schemas.scan import (
     ScanStatus,
     ScanTrigger,
 )
+from app.schemas.user import UserResponse
 
 __all__ = [
     "FileSummaryItem",
@@ -46,4 +47,5 @@ __all__ = [
     "ScanPRDetail",
     "ScanStatus",
     "ScanTrigger",
+    "UserResponse",
 ]

@@ -1,5 +1,9 @@
 """Application service layer for Sentinel workflows."""
 
+from app.services.auth_service import (
+    AuthServiceError,
+    revoke_session,
+)
 from app.services.finding_service import (
     FindingPersistenceError,
     FindingServiceError,
@@ -55,6 +59,7 @@ from app.services.scan_service import (
 )
 
 __all__ = [
+    "AuthServiceError",
     "FindingPersistenceError",
     "FindingServiceError",
     "JobClaimError",
@@ -96,6 +101,7 @@ __all__ = [
     "reap_expired_jobs",
     "renew_job_lease",
     "retry_job",
+    "revoke_session",
     "sanitize_failure_message",
     "soft_delete_project",
     "update_project",
