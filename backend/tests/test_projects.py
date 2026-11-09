@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base, utc_now
-from app.db.models import GitHubInstallation, Project, User, UserSession
+from app.db.models import Finding, GitHubInstallation, Project, Scan, User, UserSession
 from app.db.session import get_db_session, session_scope
 from app.main import app
 
@@ -1666,3 +1666,676 @@ class TestUpdateProjectEndpoint:
 
         assert resp.status_code == 422
         assert resp.json()["detail"] == "Referenced user does not exist."
+
+
+class TestDeleteProjectEndpoint:
+    """Integration and security tests for DELETE /projects/{project_id} and DELETE /api/v1/projects/{project_id}."""
+
+    def test_delete_project_success_and_persisted_deleted_at(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Authenticated owner can successfully soft-delete a project, returning 204 with empty body."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="delete-success-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 204
+        assert resp.content == b""
+        assert resp.text == ""
+
+        # Verify DB record is NOT deleted, but soft-deleted with timestamps
+        db_session.expire_all()
+        refreshed = db_session.get(Project, project.id)
+        assert refreshed is not None
+        assert refreshed.deleted_at is not None
+        assert refreshed.updated_at is not None
+        assert refreshed.deleted_at == refreshed.updated_at
+
+    def test_delete_project_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Unauthenticated delete requests fail with HTTP 401."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="unauth-delete-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = unauthenticated_client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Authentication required"
+
+    def test_delete_project_nonexistent_returns_404(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Deleting a nonexistent project ID returns generic HTTP 404."""
+        random_id = uuid.uuid4()
+        resp = client.delete(f"/api/v1/projects/{random_id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{random_id}' not found"
+
+    def test_delete_project_cross_tenant_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        other_user: User,
+    ) -> None:
+        """Attempting to delete another tenant's project returns generic HTTP 404 (Threat T4)."""
+        other_project = Project(
+            owner_user_id=other_user.id,
+            kind="manual",
+            name="other-tenant-delete-proj",
+            status="active",
+        )
+        db_session.add(other_project)
+        db_session.commit()
+
+        resp = client.delete(f"/api/v1/projects/{other_project.id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{other_project.id}' not found"
+
+    def test_delete_project_already_soft_deleted_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Attempting to delete an already soft-deleted project returns generic HTTP 404."""
+        deleted_proj = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="already-deleted-proj",
+            status="active",
+            deleted_at=utc_now(),
+        )
+        db_session.add(deleted_proj)
+        db_session.commit()
+
+        resp = client.delete(f"/api/v1/projects/{deleted_proj.id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{deleted_proj.id}' not found"
+
+    def test_delete_project_malformed_uuid_returns_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Malformed UUID path parameter returns HTTP 422."""
+        assert client.delete("/api/v1/projects/not-a-uuid").status_code == 422
+        assert client.delete("/api/v1/projects/12345").status_code == 422
+
+    def test_delete_project_preserves_related_records(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Soft-deleting a project preserves findings, scans, GitHub metadata without cascade delete."""
+        installation = GitHubInstallation(
+            installation_id=654321,
+            owner_user_id=sample_user.id,
+            account_login="org-with-records",
+            account_type="Organization",
+            status="active",
+        )
+        db_session.add(installation)
+        db_session.commit()
+
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="github",
+            name="github-with-scans",
+            installation_id=installation.id,
+            github_repo_id=98765432,
+            full_name="org-with-records/github-with-scans",
+            default_branch="main",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        scan = Scan(
+            id=uuid.uuid4(),
+            project_id=project.id,
+            trigger="manual",
+            trigger_key=f"scan-key-{uuid.uuid4()}",
+            status="succeeded",
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        finding = Finding(
+            id=uuid.uuid4(),
+            project_id=project.id,
+            fingerprint="a" * 64,
+            rule_id="RULE-SEC-01",
+            source="semgrep",
+            category="security",
+            title="SQL Injection Risk",
+            file_path="app/query.py",
+            status="open",
+            first_seen_scan_id=scan.id,
+            last_seen_scan_id=scan.id,
+        )
+        db_session.add(finding)
+        db_session.commit()
+
+        # Execute soft-delete
+        resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 204
+
+        # Verify all records remain intact in DB
+        db_session.expire_all()
+        assert db_session.get(Project, project.id) is not None
+        assert db_session.get(Project, project.id).deleted_at is not None
+        assert db_session.get(GitHubInstallation, installation.id) is not None
+        assert db_session.get(Scan, scan.id) is not None
+        assert db_session.get(Finding, finding.id) is not None
+
+    def test_delete_project_excluded_from_listings_and_details(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Deleted projects are excluded from project listings and detail/patch endpoints."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="visibility-test-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        # Delete project
+        resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 204
+
+        # Excluded from listing
+        list_resp = client.get("/api/v1/projects")
+        assert list_resp.status_code == 200
+        listed_ids = [item["id"] for item in list_resp.json()["items"]]
+        assert str(project.id) not in listed_ids
+
+        # Excluded from detail (returns 404)
+        detail_resp = client.get(f"/api/v1/projects/{project.id}")
+        assert detail_resp.status_code == 404
+
+        # Excluded from update (returns 404)
+        patch_resp = client.patch(f"/api/v1/projects/{project.id}", json={"name": "new-name"})
+        assert patch_resp.status_code == 404
+
+        # Excluded from repeated deletion (returns 404)
+        del_again_resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert del_again_resp.status_code == 404
+
+    def test_delete_project_name_can_be_reused_by_new_project(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """A soft-deleted project's name can be immediately reused to create a new active project."""
+        p1 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="recyclable-name",
+            status="active",
+        )
+        db_session.add(p1)
+        db_session.commit()
+
+        # Soft-delete the project
+        assert client.delete(f"/api/v1/projects/{p1.id}").status_code == 204
+
+        # Reusing the same name succeeds with 201
+        create_resp = client.post("/api/v1/projects", json={"name": "recyclable-name"})
+        assert create_resp.status_code == 201
+        data = create_resp.json()
+        assert data["name"] == "recyclable-name"
+        assert uuid.UUID(data["id"]) != p1.id
+
+    def test_delete_project_name_can_be_reused_by_rename(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """A soft-deleted project's name can be reused when renaming another active project."""
+        p_deleted = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="rename-target-name",
+            status="active",
+        )
+        p_active = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="temporary-name",
+            status="active",
+        )
+        db_session.add_all([p_deleted, p_active])
+        db_session.commit()
+
+        # Delete the first project
+        assert client.delete(f"/api/v1/projects/{p_deleted.id}").status_code == 204
+
+        # Rename active project to deleted project's name
+        patch_resp = client.patch(
+            f"/api/v1/projects/{p_active.id}", json={"name": "rename-target-name"}
+        )
+        assert patch_resp.status_code == 200
+        assert patch_resp.json()["name"] == "rename-target-name"
+
+    def test_delete_project_root_and_v1_routes_parity(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Both /projects/{id} and /api/v1/projects/{id} routes behave identically."""
+        p1 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="root-del-parity",
+            status="active",
+        )
+        p2 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="v1-del-parity",
+            status="active",
+        )
+        db_session.add_all([p1, p2])
+        db_session.commit()
+
+        r1 = client.delete(f"/projects/{p1.id}")
+        r2 = client.delete(f"/api/v1/projects/{p2.id}")
+
+        assert r1.status_code == 204
+        assert r2.status_code == 204
+
+        db_session.expire_all()
+        assert db_session.get(Project, p1.id).deleted_at is not None
+        assert db_session.get(Project, p2.id).deleted_at is not None
+
+    def test_delete_project_database_failure_mapped_to_500_and_rolled_back(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Database errors during soft-delete map to HTTP 500 and roll back changes."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="error-rollback-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        with patch.object(Session, "flush", side_effect=Exception("Simulated DB failure")):
+            resp = client.delete(f"/api/v1/projects/{project.id}")
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "An internal error occurred while deleting the project."
+
+        # Verify rollback: project remains active with deleted_at IS None
+        db_session.expire_all()
+        refreshed = db_session.get(Project, project.id)
+        assert refreshed is not None
+        assert refreshed.deleted_at is None
+
+
+class TestDeleteProjectEndpoint:
+    """Integration and security tests for DELETE /projects/{project_id} and DELETE /api/v1/projects/{project_id}."""
+
+    def test_delete_project_success_and_persisted_deleted_at(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Authenticated owner can successfully soft-delete a project, returning 204 with empty body."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="delete-success-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 204
+        assert resp.content == b""
+        assert resp.text == ""
+
+        # Verify DB record is NOT deleted, but soft-deleted with timestamps
+        db_session.expire_all()
+        refreshed = db_session.get(Project, project.id)
+        assert refreshed is not None
+        assert refreshed.deleted_at is not None
+        assert refreshed.updated_at is not None
+        assert refreshed.deleted_at == refreshed.updated_at
+
+    def test_delete_project_unauthenticated_returns_401(
+        self,
+        unauthenticated_client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Unauthenticated delete requests fail with HTTP 401."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="unauth-delete-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        resp = unauthenticated_client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Authentication required"
+
+    def test_delete_project_nonexistent_returns_404(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Deleting a nonexistent project ID returns generic HTTP 404."""
+        random_id = uuid.uuid4()
+        resp = client.delete(f"/api/v1/projects/{random_id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{random_id}' not found"
+
+    def test_delete_project_cross_tenant_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        other_user: User,
+    ) -> None:
+        """Attempting to delete another tenant's project returns generic HTTP 404 (Threat T4)."""
+        other_project = Project(
+            owner_user_id=other_user.id,
+            kind="manual",
+            name="other-tenant-delete-proj",
+            status="active",
+        )
+        db_session.add(other_project)
+        db_session.commit()
+
+        resp = client.delete(f"/api/v1/projects/{other_project.id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{other_project.id}' not found"
+
+    def test_delete_project_already_soft_deleted_returns_404(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Attempting to delete an already soft-deleted project returns generic HTTP 404."""
+        deleted_proj = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="already-deleted-proj",
+            status="active",
+            deleted_at=utc_now(),
+        )
+        db_session.add(deleted_proj)
+        db_session.commit()
+
+        resp = client.delete(f"/api/v1/projects/{deleted_proj.id}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == f"Project with ID '{deleted_proj.id}' not found"
+
+    def test_delete_project_malformed_uuid_returns_422(
+        self,
+        client: TestClient,
+    ) -> None:
+        """Malformed UUID path parameter returns HTTP 422."""
+        assert client.delete("/api/v1/projects/not-a-uuid").status_code == 422
+        assert client.delete("/api/v1/projects/12345").status_code == 422
+
+    def test_delete_project_preserves_related_records(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Soft-deleting a project preserves findings, scans, GitHub metadata without cascade delete."""
+        installation = GitHubInstallation(
+            installation_id=654321,
+            owner_user_id=sample_user.id,
+            account_login="org-with-records",
+            account_type="Organization",
+            status="active",
+        )
+        db_session.add(installation)
+        db_session.commit()
+
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="github",
+            name="github-with-scans",
+            installation_id=installation.id,
+            github_repo_id=98765432,
+            full_name="org-with-records/github-with-scans",
+            default_branch="main",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        scan = Scan(
+            id=uuid.uuid4(),
+            project_id=project.id,
+            trigger="manual",
+            trigger_key=f"scan-key-{uuid.uuid4()}",
+            status="succeeded",
+        )
+        db_session.add(scan)
+        db_session.commit()
+
+        finding = Finding(
+            id=uuid.uuid4(),
+            project_id=project.id,
+            fingerprint="a" * 64,
+            rule_id="RULE-SEC-01",
+            source="semgrep",
+            category="security",
+            title="SQL Injection Risk",
+            file_path="app/query.py",
+            status="open",
+            first_seen_scan_id=scan.id,
+            last_seen_scan_id=scan.id,
+        )
+        db_session.add(finding)
+        db_session.commit()
+
+        # Execute soft-delete
+        resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 204
+
+        # Verify all records remain intact in DB
+        db_session.expire_all()
+        assert db_session.get(Project, project.id) is not None
+        assert db_session.get(Project, project.id).deleted_at is not None
+        assert db_session.get(GitHubInstallation, installation.id) is not None
+        assert db_session.get(Scan, scan.id) is not None
+        assert db_session.get(Finding, finding.id) is not None
+
+    def test_delete_project_excluded_from_listings_and_details(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Deleted projects are excluded from project listings and detail/patch endpoints."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="visibility-test-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        # Delete project
+        resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert resp.status_code == 204
+
+        # Excluded from listing
+        list_resp = client.get("/api/v1/projects")
+        assert list_resp.status_code == 200
+        listed_ids = [item["id"] for item in list_resp.json()["items"]]
+        assert str(project.id) not in listed_ids
+
+        # Excluded from detail (returns 404)
+        detail_resp = client.get(f"/api/v1/projects/{project.id}")
+        assert detail_resp.status_code == 404
+
+        # Excluded from update (returns 404)
+        patch_resp = client.patch(f"/api/v1/projects/{project.id}", json={"name": "new-name"})
+        assert patch_resp.status_code == 404
+
+        # Excluded from repeated deletion (returns 404)
+        del_again_resp = client.delete(f"/api/v1/projects/{project.id}")
+        assert del_again_resp.status_code == 404
+
+    def test_delete_project_name_can_be_reused_by_new_project(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """A soft-deleted project's name can be immediately reused to create a new active project."""
+        p1 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="recyclable-name",
+            status="active",
+        )
+        db_session.add(p1)
+        db_session.commit()
+
+        # Soft-delete the project
+        assert client.delete(f"/api/v1/projects/{p1.id}").status_code == 204
+
+        # Reusing the same name succeeds with 201
+        create_resp = client.post("/api/v1/projects", json={"name": "recyclable-name"})
+        assert create_resp.status_code == 201
+        data = create_resp.json()
+        assert data["name"] == "recyclable-name"
+        assert uuid.UUID(data["id"]) != p1.id
+
+    def test_delete_project_name_can_be_reused_by_rename(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """A soft-deleted project's name can be reused when renaming another active project."""
+        p_deleted = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="rename-target-name",
+            status="active",
+        )
+        p_active = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="temporary-name",
+            status="active",
+        )
+        db_session.add_all([p_deleted, p_active])
+        db_session.commit()
+
+        # Delete the first project
+        assert client.delete(f"/api/v1/projects/{p_deleted.id}").status_code == 204
+
+        # Rename active project to deleted project's name
+        patch_resp = client.patch(
+            f"/api/v1/projects/{p_active.id}", json={"name": "rename-target-name"}
+        )
+        assert patch_resp.status_code == 200
+        assert patch_resp.json()["name"] == "rename-target-name"
+
+    def test_delete_project_root_and_v1_routes_parity(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Both /projects/{id} and /api/v1/projects/{id} routes behave identically."""
+        p1 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="root-del-parity",
+            status="active",
+        )
+        p2 = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="v1-del-parity",
+            status="active",
+        )
+        db_session.add_all([p1, p2])
+        db_session.commit()
+
+        r1 = client.delete(f"/projects/{p1.id}")
+        r2 = client.delete(f"/api/v1/projects/{p2.id}")
+
+        assert r1.status_code == 204
+        assert r2.status_code == 204
+
+        db_session.expire_all()
+        assert db_session.get(Project, p1.id).deleted_at is not None
+        assert db_session.get(Project, p2.id).deleted_at is not None
+
+    def test_delete_project_database_failure_mapped_to_500_and_rolled_back(
+        self,
+        client: TestClient,
+        db_session: Session,
+        sample_user: User,
+    ) -> None:
+        """Database errors during soft-delete map to HTTP 500 and roll back changes."""
+        project = Project(
+            owner_user_id=sample_user.id,
+            kind="manual",
+            name="error-rollback-proj",
+            status="active",
+        )
+        db_session.add(project)
+        db_session.commit()
+
+        with patch.object(Session, "flush", side_effect=Exception("Simulated DB failure")):
+            resp = client.delete(f"/api/v1/projects/{project.id}")
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "An internal error occurred while deleting the project."
+
+        # Verify rollback: project remains active with deleted_at IS None
+        db_session.expire_all()
+        refreshed = db_session.get(Project, project.id)
+        assert refreshed is not None
+        assert refreshed.deleted_at is None
+

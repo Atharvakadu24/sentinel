@@ -6,13 +6,14 @@ Implements Blueprint Section 8.1 (Projects API contracts) and Section 12
 - GET /projects/{project_id}: Get project details and configuration settings (200 OK)
 - POST /projects: Create a new manual project for the authenticated user (201 Created)
 - PATCH /projects/{project_id}: Update supported fields of an existing project (200 OK)
+- DELETE /projects/{project_id}: Soft-delete an existing project (204 No Content)
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app.api.deps import CurrentUser, DbSession, verify_project_access
 from app.db.models.project import Project
@@ -31,6 +32,7 @@ from app.services.project_service import (
     ProjectValidationError,
     create_manual_project,
     list_projects,
+    soft_delete_project,
     update_project,
 )
 
@@ -185,3 +187,26 @@ def update_project_endpoint(
         ) from exc
 
     return ProjectDetailResponse.from_orm_model(updated)
+
+
+@router.delete(
+    "/projects/{project_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete project",
+    description="Soft-delete a project owned by the authenticated user.",
+)
+def delete_project_endpoint(
+    project: Annotated[Project, Depends(verify_project_access)],
+    session: DbSession,
+) -> Response:
+    """Soft-delete an existing project for the authenticated owner."""
+    try:
+        soft_delete_project(session, project=project)
+    except ProjectServiceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while deleting the project.",
+        ) from exc
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

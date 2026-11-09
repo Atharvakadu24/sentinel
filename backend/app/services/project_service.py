@@ -299,3 +299,33 @@ def update_project(
         raise ProjectServiceError("Unexpected error updating project.") from exc
 
     return project
+
+
+def soft_delete_project(
+    session: Session,
+    *,
+    project: Project,
+    auto_commit: bool = False,
+) -> Project:
+    """Soft-delete an existing project record.
+
+    Enforces:
+    - Sets deleted_at to current UTC timestamp.
+    - Sets updated_at to current UTC timestamp.
+    - Preserves all associated records (findings, scans, github metadata).
+    - Safe transaction handling with flush and rollback on failure.
+    """
+    now = utc_now()
+    project.deleted_at = now
+    project.updated_at = now
+
+    try:
+        session.flush()
+        if auto_commit:
+            session.commit()
+            session.refresh(project)
+    except Exception as exc:
+        session.rollback()
+        raise ProjectServiceError("Unexpected error deleting project.") from exc
+
+    return project
