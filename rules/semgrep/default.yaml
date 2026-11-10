@@ -1,0 +1,11 @@
+rules:
+  - id: sentinel.default.placeholder
+    message: Sentinel static analysis rule placeholder
+    severity: INFO
+    languages:
+      - generic
+    pattern: "TODO_SENTINEL_NEVER_MATCH"
+    metadata:
+      category: other
+      confidence: LOW
+

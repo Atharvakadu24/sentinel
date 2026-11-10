@@ -15,6 +15,12 @@ from app.worker.scanner import (
     ScannerInterface,
     ScanStatus,
 )
+from app.worker.semgrep import (
+    SemgrepError,
+    SemgrepExecutionError,
+    SemgrepNormalizationError,
+    SemgrepScannerAdapter,
+)
 from app.worker.staging import (
     StagedWorkspace,
     StagingCleanupError,
@@ -52,6 +58,10 @@ __all__ = [
     "ScanStatus",
     "ScannedFile",
     "ScannerInterface",
+    "SemgrepError",
+    "SemgrepExecutionError",
+    "SemgrepNormalizationError",
+    "SemgrepScannerAdapter",
     "StagedWorkspace",
     "StagingCleanupError",
     "StagingDuplicatePathError",
