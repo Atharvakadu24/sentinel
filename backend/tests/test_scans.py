@@ -15,6 +15,7 @@ Validates Blueprint Section 7 (Workflow A: Manual code analysis), Section 8.1
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from collections.abc import Generator
 from datetime import timedelta
@@ -242,6 +243,7 @@ def production_client(
             SESSION_SECRET=valid_key,
             FINGERPRINT_KEY=valid_key,
             ENABLE_DEV_UNAUTHENTICATED_SCANS=False,
+            GITLEAKS_PATH=os.path.abspath("/usr/local/bin/gitleaks"),
         )
 
     app.dependency_overrides[get_db_session] = override_get_db_session

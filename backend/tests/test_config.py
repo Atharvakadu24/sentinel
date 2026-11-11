@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -142,10 +144,46 @@ class TestSettings:
             SECRET_KEY=SecretStr("12345678901234567890123456789012"),
             SESSION_SECRET=SecretStr("abcdef0123456789abcdef0123456789"),
             FINGERPRINT_KEY=SecretStr("fedcba9876543210fedcba9876543210"),
+            GITLEAKS_PATH=os.path.abspath("/usr/local/bin/gitleaks"),
         )
         assert settings.APP_ENV == "production"
         assert settings.validate_runtime_fingerprint_key() == b"fedcba9876543210fedcba9876543210"
         assert settings.ENABLE_DEV_UNAUTHENTICATED_SCANS is False
+
+    def test_production_fails_without_explicit_absolute_gitleaks_path(self) -> None:
+        valid_key = SecretStr("0123456789abcdef0123456789abcdef")
+        for bad_path in [
+            "gitleaks",
+            "./gitleaks",
+            "   ",
+            "//server/share/gitleaks",
+            "file:///bin/gitleaks",
+        ]:
+            with pytest.raises(
+                ValidationError,
+                match="GITLEAKS_PATH must be an explicit absolute path in production",
+            ):
+                Settings(
+                    APP_ENV="production",
+                    AI_DEBUG_LOG=False,
+                    SECRET_KEY=valid_key,
+                    SESSION_SECRET=valid_key,
+                    FINGERPRINT_KEY=valid_key,
+                    GITLEAKS_PATH=bad_path,
+                )
+
+        # Default bare "gitleaks" must also fail in production
+        with pytest.raises(
+            ValidationError,
+            match="GITLEAKS_PATH must be an explicit absolute path in production",
+        ):
+            Settings(
+                APP_ENV="production",
+                AI_DEBUG_LOG=False,
+                SECRET_KEY=valid_key,
+                SESSION_SECRET=valid_key,
+                FINGERPRINT_KEY=valid_key,
+            )
 
     def test_default_enable_dev_unauthenticated_scans_is_false(self) -> None:
         settings = Settings()

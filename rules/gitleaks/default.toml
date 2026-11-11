@@ -1,0 +1,9 @@
+# Sentinel Default Gitleaks Configuration
+#
+# Uses Gitleaks' built-in default ruleset explicitly via a Sentinel-controlled
+# configuration file rather than relying on arbitrary repository configs.
+
+title = "Sentinel Default Gitleaks Configuration"
+
+[extend]
+useDefault = true

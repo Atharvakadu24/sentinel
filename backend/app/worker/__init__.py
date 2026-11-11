@@ -4,6 +4,12 @@ Implements Blueprint Section 7 (Worker process and queue polling),
 Section 8.1 (Job queue mechanics), and Threat Mitigations T2 & T13.
 """
 
+from app.worker.gitleaks import (
+    GitleaksError,
+    GitleaksExecutionError,
+    GitleaksNormalizationError,
+    GitleaksScannerAdapter,
+)
 from app.worker.payload import PayloadValidationError, validate_scan_payload
 from app.worker.runner import JobWorker, main
 from app.worker.scanner import (
@@ -49,6 +55,10 @@ __all__ = [
     "CommandStatus",
     "CommandTimeoutError",
     "DefaultScannerEngine",
+    "GitleaksError",
+    "GitleaksExecutionError",
+    "GitleaksNormalizationError",
+    "GitleaksScannerAdapter",
     "JobWorker",
     "NonzeroExitCodeError",
     "OutputLimitExceededError",

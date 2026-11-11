@@ -7,6 +7,7 @@ using type-safe Pydantic Settings with strict secret masking and production guar
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -82,6 +83,8 @@ class Settings(BaseSettings):
     SEMGREP_PATH: str = "semgrep"
     GITLEAKS_PATH: str = "gitleaks"
     SEMGREP_RULES_PATH: str = "./rules/semgrep"
+    GITLEAKS_CONFIG_PATH: str = "./rules/gitleaks/default.toml"
+    GITLEAKS_TRUSTED_CONFIG_DIR: str | None = None
     SCANNER_TEMP_DIR: str = "/tmp/sentinel"
     SEMGREP_TIMEOUT_SEC: int = 120
     GITLEAKS_TIMEOUT_SEC: int = 60
@@ -167,6 +170,19 @@ class Settings(BaseSettings):
             if self.ENABLE_DEV_UNAUTHENTICATED_SCANS:
                 raise ValueError(
                     "Production startup failure: ENABLE_DEV_UNAUTHENTICATED_SCANS must not be true in production"
+                )
+
+            # 5. Production must pin GITLEAKS_PATH to an explicit absolute executable path
+            gitleaks_path = self.GITLEAKS_PATH.strip()
+            if (
+                not gitleaks_path
+                or "\x00" in gitleaks_path
+                or "://" in gitleaks_path
+                or gitleaks_path.startswith(("//", "\\\\"))
+                or not Path(gitleaks_path).is_absolute()
+            ):
+                raise ValueError(
+                    "Production startup failure: GITLEAKS_PATH must be an explicit absolute path in production"
                 )
 
         return self

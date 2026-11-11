@@ -6,6 +6,7 @@ and Threat Mitigations T2 (Subprocess isolation) and T8 (Path safety).
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
@@ -47,16 +48,19 @@ class StagingPathMappingError(StagingError):
     """Raised when a staged path cannot be translated back to its original path."""
 
 
+def _is_posix_platform() -> bool:
+    """Return True when running on a POSIX host where uid/mode bits apply."""
+    return os.name != "nt"
+
+
 def _on_rmtree_exc(func: Callable[[str], Any], path: str, exc: BaseException) -> None:
-    """Error handler for shutil.rmtree to remove read-only attributes on Windows."""
+    """Error handler for shutil.rmtree to clear read-only attributes without hiding failures."""
     try:
-        os.chmod(path, stat.S_IWRITE)
+        if not os.path.islink(path):
+            os.chmod(path, stat.S_IWRITE)
     except OSError:
         pass
-    try:
-        func(path)
-    except OSError:
-        pass
+    func(path)
 
 
 class StagedWorkspace:
@@ -82,6 +86,7 @@ class StagedWorkspace:
         base_dir: str | Path | None = None,
         workspace_id: str | None = None,
         source_dirname: str = "src",
+        exclude_filenames: Iterable[str] | None = None,
     ) -> None:
         """Initialize an ephemeral staging workspace.
 
@@ -90,27 +95,59 @@ class StagedWorkspace:
             base_dir: Base directory for temporary workspaces. Defaults to SCANNER_TEMP_DIR.
             workspace_id: Optional explicit unique identifier. Defaults to random hex UUID.
             source_dirname: Subdirectory name for source files (default 'src').
+            exclude_filenames: Optional collection of case-insensitive basenames to exclude from staging.
         """
         if base_dir is not None:
-            self.base_dir = Path(base_dir).resolve()
+            raw_base_dir = Path(base_dir)
         else:
             settings = get_settings()
-            self.base_dir = Path(settings.SCANNER_TEMP_DIR).resolve()
+            raw_base_dir = Path(settings.SCANNER_TEMP_DIR)
+
+        self._raw_base_dir = raw_base_dir
+        self._validate_base_dir_candidate(self._raw_base_dir)
+        self.base_dir = raw_base_dir.resolve()
 
         if workspace_id is not None:
-            if not workspace_id.strip():
-                raise ValueError("workspace_id cannot be empty or whitespace-only")
-            self.workspace_id = workspace_id.strip()
+            cleaned_workspace_id = workspace_id.strip()
+            if (
+                not cleaned_workspace_id
+                or cleaned_workspace_id in {".", ".."}
+                or "/" in cleaned_workspace_id
+                or "\\" in cleaned_workspace_id
+                or "\x00" in cleaned_workspace_id
+            ):
+                raise ValueError(f"Invalid workspace_id: {workspace_id!r}")
+            self.workspace_id = cleaned_workspace_id
         else:
             self.workspace_id = f"scan-{uuid.uuid4().hex}"
 
         self.source_dirname = source_dirname.strip()
-        if not self.source_dirname or "/" in self.source_dirname or "\\" in self.source_dirname:
+        if (
+            not self.source_dirname
+            or self.source_dirname in {".", ".."}
+            or "/" in self.source_dirname
+            or "\\" in self.source_dirname
+            or "\x00" in self.source_dirname
+        ):
             raise ValueError(f"Invalid source_dirname: {source_dirname!r}")
 
-        # Unique workspace path under base_dir
+        self._excluded_filenames: frozenset[str] = frozenset(
+            name.strip().casefold()
+            for name in (exclude_filenames or ())
+            if isinstance(name, str) and name.strip()
+        )
+
+        # Unique workspace path strictly contained under base_dir
         self.path = (self.base_dir / self.workspace_id).resolve()
+        if self.path == self.base_dir or not self.path.is_relative_to(self.base_dir):
+            raise StagingPathTraversalError(
+                f"Workspace path '{self.path}' escapes base directory '{self.base_dir}'"
+            )
         self.source_dir = (self.path / self.source_dirname).resolve()
+        if self.source_dir == self.path or not self.source_dir.is_relative_to(self.path):
+            raise StagingPathTraversalError(
+                f"Source directory '{self.source_dir}' escapes workspace '{self.path}'"
+            )
 
         # Bidirectional mappings:
         # original normalized path -> staged absolute Path
@@ -120,6 +157,7 @@ class StagedWorkspace:
 
         self.staged_files: list[ScannedFile] = []
         self.skipped_files: list[ScannedFile] = []
+        self.excluded_files: list[ScannedFile] = []
         self._cleaned_up: bool = False
         self._initialized: bool = False
 
@@ -128,15 +166,53 @@ class StagedWorkspace:
         if files is not None:
             self.stage_files(files)
 
+    def _validate_base_dir_candidate(self, base_dir: Path) -> None:
+        """Validate pre-existing base_dir is not a symlink and has safe POSIX ownership/mode."""
+        if not os.path.lexists(base_dir):
+            return
+
+        try:
+            st = os.lstat(base_dir)
+        except OSError as exc:
+            raise StagingError(
+                f"Unable to inspect base workspace directory '{base_dir}': {exc}"
+            ) from exc
+
+        if stat.S_ISLNK(st.st_mode):
+            raise StagingSymlinkError(
+                f"Base workspace directory '{base_dir}' must not be a symlink"
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise StagingError(f"Base workspace path '{base_dir}' is not a directory")
+
+        if _is_posix_platform():
+            geteuid = getattr(os, "geteuid", None)
+            if callable(geteuid) and st.st_uid != geteuid():
+                raise StagingError(
+                    f"Base workspace directory '{base_dir}' is not owned by the current user"
+                )
+            if st.st_mode & stat.S_IWOTH:
+                raise StagingError(
+                    f"Base workspace directory '{base_dir}' has unsafe world-writable permissions"
+                )
+
     def _initialize_workspace(self) -> None:
         """Create the isolated workspace directory structure with restrictive permissions."""
-        if self.path.exists():
+        if os.path.lexists(self.path):
             raise StagingError(
                 f"Workspace directory '{self.path}' already exists; reuse is prohibited"
             )
 
+        self._validate_base_dir_candidate(self._raw_base_dir)
+
         # Create base directory if missing
         self.base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._validate_base_dir_candidate(self.base_dir)
+
+        if os.path.lexists(self.path):
+            raise StagingError(
+                f"Workspace directory '{self.path}' already exists; reuse is prohibited"
+            )
 
         # Create unique workspace root and source directory
         self.path.mkdir(parents=False, exist_ok=False, mode=0o700)
@@ -190,53 +266,143 @@ class StagedWorkspace:
                 )
             seen_casefold_paths.add(casefolded)
 
-            # 3. Construct destination path inside source_dir
-            dest_path = (self.source_dir / normalized_path).resolve()
+            # Exclude scanner-control files by basename without mutating input payloads
+            if Path(normalized_path).name.casefold() in self._excluded_filenames:
+                self.excluded_files.append(file_item)
+                logger.debug("Excluding scanner-control file '%s' from staging", normalized_path)
+                continue
+
+            # 3. Validate unresolved destination and existing ancestors for symlinks BEFORE .resolve()
+            unresolved_dest = self.source_dir / normalized_path
+            self._verify_no_symlinks(unresolved_dest, self.source_dir)
 
             # 4. Strict containment check: dest_path must remain strictly inside source_dir
+            dest_path = unresolved_dest.resolve()
             if not dest_path.is_relative_to(resolved_source_dir):
                 raise StagingPathTraversalError(
                     f"File path '{normalized_path}' resolves outside workspace source directory: '{dest_path}'"
                 )
 
-            # 5. Symlink check: inspect destination and intermediate parent directories
+            # 5. Re-verify no symlinks exist on resolved path/ancestors
             self._verify_no_symlinks(dest_path, resolved_source_dir)
 
-            # 6. Create parent directories with restrictive permissions
-            dest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # 6. Create parent directories component-by-component without traversing symlinks
+            curr_dir = self.source_dir
+            for part in Path(normalized_path).parent.parts:
+                curr_dir = curr_dir / part
+                if os.path.lexists(curr_dir):
+                    dir_stat = os.lstat(curr_dir)
+                    if stat.S_ISLNK(dir_stat.st_mode):
+                        raise StagingSymlinkError(
+                            f"Intermediate directory '{curr_dir}' in path '{unresolved_dest}' is a symlink"
+                        )
+                    if not stat.S_ISDIR(dir_stat.st_mode):
+                        raise StagingError(f"Intermediate path '{curr_dir}' is not a directory")
+                else:
+                    try:
+                        curr_dir.mkdir(parents=False, exist_ok=False, mode=0o700)
+                    except FileExistsError:
+                        dir_stat = os.lstat(curr_dir)
+                        if stat.S_ISLNK(dir_stat.st_mode):
+                            raise StagingSymlinkError(
+                                f"Intermediate directory '{curr_dir}' in path '{unresolved_dest}' is a symlink"
+                            ) from None
+                        if not stat.S_ISDIR(dir_stat.st_mode):
+                            raise StagingError(
+                                f"Intermediate path '{curr_dir}' is not a directory"
+                            ) from None
 
-            # 7. Write file content deterministically
-            dest_path.write_text(file_item.content, encoding="utf-8")
-
-            # 8. Apply restrictive file permissions where supported (POSIX 0600)
+            # 7. Create regular file via descriptor with O_NOFOLLOW + 0600 permissions
+            o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+            open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | o_nofollow
             try:
-                dest_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-            except (OSError, NotImplementedError):
-                pass
+                fd = os.open(unresolved_dest, open_flags, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError as exc:
+                if exc.errno in {
+                    getattr(errno, "ELOOP", -1),
+                    getattr(errno, "EMLINK", -1),
+                } or (
+                    os.path.lexists(unresolved_dest)
+                    and stat.S_ISLNK(os.lstat(unresolved_dest).st_mode)
+                ):
+                    raise StagingSymlinkError(
+                        f"Destination path '{unresolved_dest}' is a symlink"
+                    ) from exc
+                raise StagingError(
+                    f"Unable to stage file '{normalized_path}' safely: {exc}"
+                ) from exc
+
+            try:
+                fd_stat = os.fstat(fd)
+                if not stat.S_ISREG(fd_stat.st_mode):
+                    raise StagingError(
+                        f"Staged destination '{unresolved_dest}' is not a regular file"
+                    )
+                if hasattr(os, "fchmod"):
+                    try:
+                        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+                    except (OSError, NotImplementedError):
+                        pass
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                    fd = -1
+                    handle.write(file_item.content)
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+            # 8. Ensure restrictive file permissions on platforms without fchmod
+            if not hasattr(os, "fchmod"):
+                try:
+                    dest_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+                except (OSError, NotImplementedError):
+                    pass
 
             # 9. Register bidirectional mappings
             self._register_mappings(normalized_path, dest_path)
             self.staged_files.append(file_item)
 
         logger.debug(
-            "Workspace %s staged %d files (%d skipped)",
+            "Workspace %s staged %d files (%d skipped, %d excluded)",
             self.workspace_id,
             len(self.staged_files),
             len(self.skipped_files),
+            len(self.excluded_files),
         )
 
     def _verify_no_symlinks(self, dest_path: Path, root_dir: Path) -> None:
-        """Verify that dest_path and none of its existing parent directories are symlinks."""
-        if dest_path.is_symlink():
-            raise StagingSymlinkError(f"Destination path '{dest_path}' is a symlink")
+        """Verify dest_path and all existing components up to root_dir are not symlinks."""
+        if os.path.lexists(root_dir):
+            root_stat = os.lstat(root_dir)
+            if stat.S_ISLNK(root_stat.st_mode):
+                raise StagingSymlinkError(f"Workspace root '{root_dir}' is a symlink")
+            if not stat.S_ISDIR(root_stat.st_mode):
+                raise StagingError(f"Workspace root '{root_dir}' is not a directory")
 
-        curr: Path | None = dest_path.parent
-        while curr is not None and curr != root_dir and curr.is_relative_to(root_dir):
-            if curr.exists() and curr.is_symlink():
-                raise StagingSymlinkError(
-                    f"Intermediate directory '{curr}' in path '{dest_path}' is a symlink"
+        curr: Path = dest_path
+        while True:
+            if os.path.lexists(curr):
+                st = os.lstat(curr)
+                if stat.S_ISLNK(st.st_mode):
+                    if curr == dest_path:
+                        raise StagingSymlinkError(f"Destination path '{dest_path}' is a symlink")
+                    raise StagingSymlinkError(
+                        f"Intermediate directory '{curr}' in path '{dest_path}' is a symlink"
+                    )
+                if curr != dest_path and not stat.S_ISDIR(st.st_mode):
+                    raise StagingError(f"Intermediate path '{curr}' is not a directory")
+
+            if curr == root_dir:
+                break
+
+            parent = curr.parent
+            if parent == curr or not parent.is_relative_to(root_dir):
+                raise StagingPathTraversalError(
+                    f"Path '{dest_path}' escapes workspace source directory '{root_dir}'"
                 )
-            curr = curr.parent
+            curr = parent
 
     def _register_mappings(self, original_norm_path: str, staged_path: Path) -> None:
         """Register lookup keys for bidirectional path resolution."""
@@ -349,9 +515,12 @@ class StagedWorkspace:
         Raises:
             StagingCleanupError: If cleanup fails or safety invariants are violated.
         """
-        if self._cleaned_up or not self.path.exists():
+        if self._cleaned_up or not os.path.lexists(self.path):
             self._cleaned_up = True
             return
+
+        if os.path.islink(self.path):
+            raise StagingCleanupError(f"Refusing to delete symlink workspace path: '{self.path}'")
 
         res_path = self.path.resolve()
         res_base = self.base_dir.resolve()
@@ -364,6 +533,8 @@ class StagedWorkspace:
 
         try:
             shutil.rmtree(self.path, onexc=_on_rmtree_exc)
+            if os.path.lexists(self.path):
+                raise OSError("Staged workspace path still exists after recursive removal")
             self._cleaned_up = True
             logger.debug("Successfully cleaned up staged workspace at %s", self.path)
         except Exception as exc:
