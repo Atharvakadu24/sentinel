@@ -31,6 +31,9 @@ packages = ["app"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "postgres: opt-in integration tests requiring a disposable PostgreSQL database via SENTINEL_TEST_DATABASE_URL",
+]
 
 [tool.ruff]
 line-length = 100
