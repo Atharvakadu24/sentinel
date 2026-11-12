@@ -26,14 +26,19 @@ _RE_DB_URL = re.compile(
 )
 _RE_SECRETS = re.compile(
     r"\b(?:"
-    r"ghp_[a-zA-Z0-9]{20,}|"
-    r"github_pat_[a-zA-Z0-9_]{20,}|"
-    r"gho_[a-zA-Z0-9]{20,}|"
+    r"ghp_[a-zA-Z0-9_]{10,}|"
+    r"github_pat_[a-zA-Z0-9_]{10,}|"
+    r"gho_[a-zA-Z0-9_]{10,}|"
+    r"ghs_[a-zA-Z0-9_]{10,}|"
+    r"ghu_[a-zA-Z0-9_]{10,}|"
+    r"ghr_[a-zA-Z0-9_]{10,}|"
+    r"eyJ[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}|"
     r"glpat-[a-zA-Z0-9\-_]{20,}|"
     r"AIza[0-9A-Za-z-_]{35}|"
     r"sk-ant-[a-zA-Z0-9_\-]{20,}|"
     r"sk-[a-zA-Z0-9_\-]{20,}"
     r")\b"
+    r"|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
 )
 _RE_KEY_VALUE_SECRETS = re.compile(
     r"(?i)\b(password|passwd|secret|api_key|token|auth_token)\s*[:=]\s*['\"]?[^\s'\",;]+",

@@ -6,11 +6,32 @@ scanner engine or analysis step receives files.
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from typing import Any
 
 from app.domain.paths import normalize_and_validate_path
 from app.services.scan_service import MAX_FILE_BYTES, MAX_FILES_COUNT, MAX_TOTAL_BYTES
 from app.worker.scanner import ScanJobPayload, ScannedFile
+
+_RE_GIT_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_RE_GITHUB_FULL_NAME = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_FORBIDDEN_PAYLOAD_SECRET_KEYS = frozenset(
+    {"token", "access_token", "installation_token", "private_key", "secret", "password", "jwt"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubPRScanJobPayload:
+    """Validated immutable payload for a queued GitHub pull-request scan job."""
+
+    installation_id: int
+    github_repo_id: int
+    full_name: str
+    pr_number: int
+    head_sha: str
+    base_sha: str | None = None
+    run_ai: bool = True
 
 
 class PayloadValidationError(Exception):
@@ -138,3 +159,63 @@ def validate_scan_payload(raw: Any) -> ScanJobPayload:
         )
 
     return ScanJobPayload(files=validated_files, run_ai=raw_run_ai)
+
+
+def validate_github_pr_scan_payload(raw: Any) -> GitHubPRScanJobPayload:
+    """Validate and normalize a raw GitHub PR scan Job.payload dictionary."""
+    if not isinstance(raw, dict):
+        raise PayloadValidationError(
+            f"Job payload must be a JSON object dictionary, got '{type(raw).__name__}'"
+        )
+
+    for forbidden in _FORBIDDEN_PAYLOAD_SECRET_KEYS:
+        if forbidden in raw:
+            raise PayloadValidationError(
+                f"Job payload must not contain credential field '{forbidden}'"
+            )
+
+    def _req_pos_int(key: str) -> int:
+        val = raw.get(key)
+        if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+            raise PayloadValidationError(f"Job payload '{key}' must be a positive integer")
+        return val
+
+    installation_id = _req_pos_int("installation_id")
+    github_repo_id = _req_pos_int("github_repo_id")
+    pr_number = _req_pos_int("pr_number")
+
+    full_name = raw.get("full_name")
+    if not isinstance(full_name, str) or not _RE_GITHUB_FULL_NAME.match(full_name.strip()):
+        raise PayloadValidationError("Job payload 'full_name' must be a valid 'owner/repo' string")
+    owner, repo = full_name.strip().split("/", 1)
+    if owner in (".", "..") or repo in (".", ".."):
+        raise PayloadValidationError("Job payload 'full_name' contains invalid path segments")
+
+    head_sha = raw.get("head_sha")
+    if not isinstance(head_sha, str) or not _RE_GIT_SHA.match(head_sha.strip()):
+        raise PayloadValidationError("Job payload 'head_sha' must be a valid commit SHA")
+
+    base_sha = raw.get("base_sha")
+    cleaned_base: str | None = None
+    if base_sha is not None:
+        if not isinstance(base_sha, str) or not _RE_GIT_SHA.match(base_sha.strip()):
+            raise PayloadValidationError(
+                "Job payload 'base_sha' must be a valid commit SHA or None"
+            )
+        cleaned_base = base_sha.strip().lower()
+
+    raw_run_ai = raw.get("run_ai", True)
+    if not isinstance(raw_run_ai, bool):
+        raise PayloadValidationError(
+            f"Job payload 'run_ai' must be a boolean, got '{type(raw_run_ai).__name__}'"
+        )
+
+    return GitHubPRScanJobPayload(
+        installation_id=installation_id,
+        github_repo_id=github_repo_id,
+        full_name=full_name.strip(),
+        pr_number=pr_number,
+        head_sha=head_sha.strip().lower(),
+        base_sha=cleaned_base,
+        run_ai=raw_run_ai,
+    )

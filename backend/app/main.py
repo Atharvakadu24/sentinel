@@ -8,9 +8,11 @@ from fastapi import FastAPI
 
 from app.api.auth import router as auth_router
 from app.api.findings import router as findings_router
+from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.api.projects import router as projects_router
 from app.api.scans import router as scans_router
+from app.api.webhooks import router as webhooks_router
 
 app = FastAPI(
     title="Sentinel API",
@@ -26,6 +28,8 @@ app.include_router(auth_router)
 app.include_router(projects_router)
 app.include_router(scans_router)
 app.include_router(findings_router)
+app.include_router(github_router)
+app.include_router(webhooks_router)
 
 # Versioned API routes
 app.include_router(health_router, prefix="/api/v1")
@@ -33,3 +37,5 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(projects_router, prefix="/api/v1")
 app.include_router(scans_router, prefix="/api/v1")
 app.include_router(findings_router, prefix="/api/v1")
+app.include_router(github_router, prefix="/api/v1")
+app.include_router(webhooks_router, prefix="/api/v1")

@@ -13,17 +13,24 @@ import threading
 import time
 import types
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Self
 
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.base import utc_now
-from app.db.models import Job
+from app.db.models import Job, Scan
 from app.db.session import dispose_engine, get_session_factory, session_scope
+from app.domain.paths import normalize_and_validate_path
 from app.services.finding_service import persist_scan_findings
+from app.services.github_client import (
+    GitHubAppClient,
+    GitHubClientError,
+    GitHubRateLimitError,
+)
 from app.services.job_service import (
     JobInvalidStateError,
     JobNotFoundError,
@@ -36,10 +43,24 @@ from app.services.job_service import (
     renew_job_lease,
     sanitize_failure_message,
 )
-from app.worker.payload import PayloadValidationError, validate_scan_payload
+from app.services.scan_service import (
+    MAX_FILE_BYTES,
+    MAX_FILES_COUNT,
+    MAX_TOTAL_BYTES,
+    is_extension_supported,
+    is_minified_or_generated,
+)
+from app.worker.payload import (
+    GitHubPRScanJobPayload,
+    PayloadValidationError,
+    validate_github_pr_scan_payload,
+    validate_scan_payload,
+)
 from app.worker.scanner import (
     DefaultScannerEngine,
     ScanExecutionResult,
+    ScanJobPayload,
+    ScannedFile,
     ScannerInterface,
     ScanStatus,
 )
@@ -353,10 +374,12 @@ class JobWorker:
         heartbeat_interval_sec: float | None = None,
         reaper_interval_sec: float | None = None,
         heartbeat_shutdown_timeout_sec: float | None = None,
+        github_client_factory: Callable[[], GitHubAppClient] | None = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:12]}"
         self.scanner: ScannerInterface = scanner or DefaultScannerEngine()
+        self._github_client_factory = github_client_factory
         settings = get_settings()
         self.poll_interval_sec = (
             poll_interval_sec
@@ -571,25 +594,73 @@ class JobWorker:
             raw_payload = job.payload
             initial_locked_until = job.locked_until
 
-        # Phase 1.1: Validate supported job type
-        if job_type != "scan":
-            logger.error("Job %s rejected: unsupported job type '%s'", job_id, job_type)
-            fail_time = completion_now or (now if now is not None else utc_now())
-            with session_scope(self.session_factory) as session:
-                return fail_job(
-                    session,
-                    job_id=job_id,
-                    worker_id=self.worker_id,
-                    error_message=f"Unsupported job type: '{job_type}'",
-                    error_code="UNSUPPORTED_JOB_TYPE",
-                    retryable=False,
-                    now=fail_time,
-                    auto_commit=True,
-                )
+            if job_type == "github_pr_scan":
+                try:
+                    pr_payload_check = validate_github_pr_scan_payload(raw_payload)
+                except PayloadValidationError:
+                    pr_payload_check = None
+                if pr_payload_check is not None:
+                    scan_obj = job.scan
+                    proj_obj = scan_obj.project if scan_obj is not None else None
+                    inst_obj = proj_obj.installation if proj_obj is not None else None
+                    if (
+                        scan_obj is None
+                        or proj_obj is None
+                        or proj_obj.kind != "github"
+                        or proj_obj.deleted_at is not None
+                        or proj_obj.status != "active"
+                    ):
+                        fail_time = completion_now or start_time
+                        return fail_job(
+                            session,
+                            job_id=job_id,
+                            worker_id=self.worker_id,
+                            error_message="Target GitHub project is no longer active",
+                            error_code="PROJECT_INACTIVE",
+                            retryable=False,
+                            now=fail_time,
+                            auto_commit=True,
+                        )
+                    if (
+                        inst_obj is None
+                        or inst_obj.status != "active"
+                        or inst_obj.installation_id != pr_payload_check.installation_id
+                        or proj_obj.github_repo_id != pr_payload_check.github_repo_id
+                    ):
+                        fail_time = completion_now or start_time
+                        return fail_job(
+                            session,
+                            job_id=job_id,
+                            worker_id=self.worker_id,
+                            error_message="GitHub installation or repository mapping is inactive or mismatched",
+                            error_code="INSTALLATION_INACTIVE",
+                            retryable=False,
+                            now=fail_time,
+                            auto_commit=True,
+                        )
 
-        # Phase 1.2: Validate payload structure and content safety
+        # Phase 1.1: Validate supported job type and payload structure
+        manual_payload: ScanJobPayload | None = None
+        pr_payload: GitHubPRScanJobPayload | None = None
         try:
-            payload = validate_scan_payload(raw_payload)
+            if job_type == "scan":
+                manual_payload = validate_scan_payload(raw_payload)
+            elif job_type == "github_pr_scan":
+                pr_payload = validate_github_pr_scan_payload(raw_payload)
+            else:
+                logger.error("Job %s rejected: unsupported job type '%s'", job_id, job_type)
+                fail_time = completion_now or (now if now is not None else utc_now())
+                with session_scope(self.session_factory) as session:
+                    return fail_job(
+                        session,
+                        job_id=job_id,
+                        worker_id=self.worker_id,
+                        error_message=f"Unsupported job type: '{job_type}'",
+                        error_code="UNSUPPORTED_JOB_TYPE",
+                        retryable=False,
+                        now=fail_time,
+                        auto_commit=True,
+                    )
         except PayloadValidationError as err:
             sanitized_err = sanitize_failure_message(str(err))
             logger.error("Job %s payload validation failed: %s", job_id, sanitized_err)
@@ -609,6 +680,7 @@ class JobWorker:
         # Phase 2: Execute scanner completely outside any database session or connection
         # Scoped background heartbeat periodically renews the lease for long-running scans
         scan_result: ScanExecutionResult
+        pr_files_summary: list[dict[str, Any]] | None = None
         scan_cancel_event = threading.Event()
         heartbeat = JobHeartbeat(
             session_factory=self.session_factory,
@@ -623,13 +695,29 @@ class JobWorker:
         )
         try:
             with heartbeat:
-                if _scanner_supports_cancel_event(self.scanner):
-                    scan_result = self.scanner.scan(  # type: ignore[call-arg]
-                        payload,
+                effective_payload = manual_payload
+                early_result: ScanExecutionResult | None = None
+                if pr_payload is not None:
+                    (
+                        effective_payload,
+                        pr_files_summary,
+                        early_result,
+                    ) = self._build_pr_scan_input(
+                        pr_payload,
                         cancel_event=scan_cancel_event,
                     )
+
+                if early_result is not None:
+                    scan_result = early_result
                 else:
-                    scan_result = self.scanner.scan(payload)
+                    assert effective_payload is not None
+                    if _scanner_supports_cancel_event(self.scanner):
+                        scan_result = self.scanner.scan(  # type: ignore[call-arg]
+                            effective_payload,
+                            cancel_event=scan_cancel_event,
+                        )
+                    else:
+                        scan_result = self.scanner.scan(effective_payload)
         except Exception as exc:  # noqa: BLE001 - catch unexpected scanner crashes to fail job
             # If heartbeat failed to terminate cleanly or renewal is in-flight, fail closed without updating DB
             if heartbeat.is_alive or heartbeat.is_renewal_in_flight or not heartbeat.clean_shutdown:
@@ -714,7 +802,248 @@ class JobWorker:
                 job_id=job_id,
                 scan_result=scan_result,
                 current_time=finished_time,
+                files_summary=pr_files_summary,
             )
+
+    def _build_pr_scan_input(
+        self,
+        pr_payload: GitHubPRScanJobPayload,
+        *,
+        cancel_event: threading.Event,
+    ) -> tuple[ScanJobPayload | None, list[dict[str, Any]], ScanExecutionResult | None]:
+        """Fetch bounded PR changed files from GitHub outside database transactions."""
+        files_summary: list[dict[str, Any]] = []
+        scanned_files: list[ScannedFile] = []
+        seen_casefold: set[str] = set()
+        total_bytes = 0
+        fetched_supported_count = 0
+
+        try:
+            client = (
+                self._github_client_factory()
+                if self._github_client_factory is not None
+                else GitHubAppClient.from_settings(get_settings())
+            )
+            with client:
+                changed_files = client.list_pull_request_files(
+                    pr_payload.installation_id,
+                    pr_payload.full_name,
+                    pr_payload.pr_number,
+                )
+
+                if cancel_event.is_set() or self._stop_event.is_set():
+                    return (
+                        None,
+                        files_summary,
+                        ScanExecutionResult(
+                            status=ScanStatus.FAILED,
+                            error_code="SCAN_CANCELED",
+                            error_message="Pull request scan aborted due to cancellation or worker shutdown",
+                            retryable=False,
+                        ),
+                    )
+
+                # Deterministic ordering while skipping removed files
+                candidates: list[str] = []
+                for entry in changed_files:
+                    if entry.status == "removed":
+                        continue
+                    try:
+                        normalized = normalize_and_validate_path(entry.filename)
+                    except (ValueError, TypeError):
+                        sanitized_bad_path = "".join(
+                            ch if ord(ch) >= 32 and ch != "\x7f" else "_" for ch in entry.filename
+                        )[:200]
+                        files_summary.append(
+                            {
+                                "path": sanitized_bad_path,
+                                "byte_size": 0,
+                                "scanned": False,
+                                "skip_reason": "invalid_path",
+                            }
+                        )
+                        continue
+                    cf = normalized.casefold()
+                    if cf in seen_casefold:
+                        continue
+                    seen_casefold.add(cf)
+                    candidates.append(normalized)
+
+                for path in sorted(candidates):
+                    if cancel_event.is_set() or self._stop_event.is_set():
+                        return (
+                            None,
+                            files_summary,
+                            ScanExecutionResult(
+                                status=ScanStatus.FAILED,
+                                error_code="SCAN_CANCELED",
+                                error_message="Pull request scan aborted due to cancellation or worker shutdown",
+                                retryable=False,
+                            ),
+                        )
+
+                    if not is_extension_supported(path):
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": 0,
+                                "scanned": False,
+                                "skip_reason": "unsupported_extension",
+                            }
+                        )
+                        continue
+
+                    if fetched_supported_count >= MAX_FILES_COUNT or total_bytes >= MAX_TOTAL_BYTES:
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": 0,
+                                "scanned": False,
+                                "skip_reason": "batch_limit_exceeded",
+                            }
+                        )
+                        continue
+
+                    fetched_supported_count += 1
+                    file_data = client.get_file_content(
+                        pr_payload.installation_id,
+                        pr_payload.full_name,
+                        path,
+                        pr_payload.head_sha,
+                        max_bytes=MAX_FILE_BYTES,
+                    )
+                    if file_data.skip_reason is not None or file_data.content is None:
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": file_data.size,
+                                "scanned": False,
+                                "skip_reason": file_data.skip_reason or "unreadable_file",
+                            }
+                        )
+                        continue
+
+                    raw_bytes = file_data.content
+                    if total_bytes + len(raw_bytes) > MAX_TOTAL_BYTES:
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": len(raw_bytes),
+                                "scanned": False,
+                                "skip_reason": "batch_limit_exceeded",
+                            }
+                        )
+                        continue
+
+                    if b"\x00" in raw_bytes:
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": len(raw_bytes),
+                                "scanned": False,
+                                "skip_reason": "binary_or_nul",
+                            }
+                        )
+                        continue
+
+                    try:
+                        text_content = raw_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": len(raw_bytes),
+                                "scanned": False,
+                                "skip_reason": "binary_or_non_utf8",
+                            }
+                        )
+                        continue
+
+                    if is_minified_or_generated(text_content):
+                        files_summary.append(
+                            {
+                                "path": path,
+                                "byte_size": len(raw_bytes),
+                                "scanned": False,
+                                "skip_reason": "minified_or_generated",
+                            }
+                        )
+                        continue
+
+                    total_bytes += len(raw_bytes)
+                    files_summary.append(
+                        {
+                            "path": path,
+                            "byte_size": len(raw_bytes),
+                            "scanned": True,
+                            "skip_reason": None,
+                        }
+                    )
+                    scanned_files.append(
+                        ScannedFile(
+                            path=path,
+                            content=text_content,
+                            scanned=True,
+                            skip_reason=None,
+                        )
+                    )
+        except GitHubRateLimitError as exc:
+            safe_delay = (
+                exc.retry_after_sec
+                if exc.retry_after_sec is not None and exc.retry_after_sec > 0
+                else None
+            )
+            return (
+                None,
+                files_summary,
+                ScanExecutionResult(
+                    status=ScanStatus.FAILED,
+                    error_code=exc.error_code,
+                    error_message=sanitize_failure_message(str(exc)),
+                    retryable=True,
+                    retry_delay_sec=safe_delay,
+                ),
+            )
+        except GitHubClientError as exc:
+            return (
+                None,
+                files_summary,
+                ScanExecutionResult(
+                    status=ScanStatus.FAILED,
+                    error_code=exc.error_code,
+                    error_message=sanitize_failure_message(str(exc)),
+                    retryable=exc.retryable,
+                ),
+            )
+
+        if not scanned_files:
+            return (
+                None,
+                files_summary,
+                ScanExecutionResult(
+                    status=ScanStatus.SUCCEEDED,
+                    findings=[],
+                    counts={
+                        "critical": 0,
+                        "high": 0,
+                        "medium": 0,
+                        "low": 0,
+                        "info": 0,
+                    },
+                    components={
+                        "github_fetch": {
+                            "status": "skipped_empty",
+                            "files_examined": len(files_summary),
+                        }
+                    },
+                ),
+            )
+
+        return (
+            ScanJobPayload(files=scanned_files, run_ai=pr_payload.run_ai),
+            files_summary,
+            None,
+        )
 
     def _finalize_canceled_scan_job(
         self,
@@ -761,26 +1090,31 @@ class JobWorker:
         job_id: uuid.UUID,
         scan_result: ScanExecutionResult,
         current_time: datetime,
+        files_summary: list[dict[str, Any]] | None = None,
     ) -> Job:
         """Route the structured scanner execution result to job and scan state."""
         existing_job = session.get(Job, job_id)
-        if (
-            existing_job is not None
-            and existing_job.scan is not None
-            and existing_job.scan.status in ("canceled", "superseded")
-        ):
-            logger.info(
-                "Job %s discarding scanner results because scan %s is '%s'",
-                job_id,
-                existing_job.scan.id,
-                existing_job.scan.status,
-            )
-            return self._finalize_canceled_scan_job(
-                session=session,
-                job_id=job_id,
-                scan_status=existing_job.scan.status,
-                current_time=current_time,
-            )
+        if existing_job is not None:
+            bind = session.get_bind()
+            if bind is not None and bind.dialect.name == "postgresql":
+                locked_scan = session.scalar(
+                    select(Scan).where(Scan.id == existing_job.scan_id).with_for_update()
+                )
+            else:
+                locked_scan = session.get(Scan, existing_job.scan_id)
+            if locked_scan is not None and locked_scan.status in ("canceled", "superseded"):
+                logger.info(
+                    "Job %s discarding scanner results because scan %s is '%s'",
+                    job_id,
+                    locked_scan.id,
+                    locked_scan.status,
+                )
+                return self._finalize_canceled_scan_job(
+                    session=session,
+                    job_id=job_id,
+                    scan_status=locked_scan.status,
+                    current_time=current_time,
+                )
 
         if scan_result.status in (ScanStatus.SUCCEEDED, ScanStatus.PARTIAL):
             scan_terminal_status = (
@@ -819,6 +1153,8 @@ class JobWorker:
                 )
 
                 if completed_job.scan is not None:
+                    if files_summary is not None:
+                        completed_job.scan.files_summary = files_summary
                     if scan_result.components is not None:
                         completed_job.scan.components = scan_result.components
 

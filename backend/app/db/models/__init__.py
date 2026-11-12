@@ -15,6 +15,7 @@ Blueprint Section 8.1:
 """
 
 from app.db.models.finding import Finding, FindingStatusHistory
+from app.db.models.github import GitHubInstallState
 from app.db.models.observability import AIReview, WebhookEvent
 from app.db.models.project import GitHubInstallation, Project
 from app.db.models.scan import Job, Scan, ScanFinding
@@ -24,6 +25,7 @@ __all__ = [
     "AIReview",
     "Finding",
     "FindingStatusHistory",
+    "GitHubInstallState",
     "GitHubInstallation",
     "Job",
     "Project",

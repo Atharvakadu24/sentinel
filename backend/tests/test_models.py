@@ -58,11 +58,12 @@ class TestModelDefinitions:
     """Tests for metadata completeness and table declarations."""
 
     def test_all_eleven_core_tables_registered(self) -> None:
-        """Blueprint Section 8.1 lists exactly 11 core tables."""
+        """All Blueprint Section 8.1 tables and milestone extension tables are registered."""
         expected_tables = {
             "users",
             "user_sessions",
             "github_installations",
+            "github_install_states",
             "projects",
             "scans",
             "jobs",

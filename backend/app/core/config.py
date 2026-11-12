@@ -6,9 +6,11 @@ using type-safe Pydantic Settings with strict secret masking and production guar
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -64,6 +66,13 @@ class Settings(BaseSettings):
     GITHUB_CLIENT_SECRET: SecretStr | None = None
     GITHUB_WEBHOOK_SECRET: SecretStr | None = None
     GITHUB_APP_PRIVATE_KEY_PATH: str | None = "./secrets/github-app.private-key.pem"
+    GITHUB_APP_PRIVATE_KEY: SecretStr | None = None
+    GITHUB_APP_SLUG: str | None = None
+    GITHUB_APP_INSTALL_CALLBACK_URL: str | None = None
+    GITHUB_API_BASE_URL: str = "https://api.github.com"
+    GITHUB_OAUTH_BASE_URL: str = "https://github.com"
+    GITHUB_STATE_TTL_SEC: int = 600
+    GITHUB_CLIENT_TIMEOUT_SEC: float = 15.0
 
     # AI Review & LLM
     LLM_PROVIDER: Literal["anthropic", "gemini"] = "anthropic"
@@ -185,7 +194,249 @@ class Settings(BaseSettings):
                     "Production startup failure: GITLEAKS_PATH must be an explicit absolute path in production"
                 )
 
+            # 6. Validate configured GitHub webhook/app/OAuth secrets in production
+            if self.GITHUB_WEBHOOK_SECRET is not None:
+                _validate_production_secret("GITHUB_WEBHOOK_SECRET", self.GITHUB_WEBHOOK_SECRET)
+            if self.GITHUB_CLIENT_SECRET is not None:
+                _validate_production_secret("GITHUB_CLIENT_SECRET", self.GITHUB_CLIENT_SECRET)
+
+            has_explicit_key_path = (
+                "GITHUB_APP_PRIVATE_KEY_PATH" in self.model_fields_set
+                and self.GITHUB_APP_PRIVATE_KEY_PATH is not None
+                and bool(self.GITHUB_APP_PRIVATE_KEY_PATH.strip())
+            )
+            has_any_github_config = (
+                self.GITHUB_APP_ID is not None
+                or self.GITHUB_CLIENT_ID is not None
+                or self.GITHUB_CLIENT_SECRET is not None
+                or self.GITHUB_APP_PRIVATE_KEY is not None
+                or has_explicit_key_path
+                or self.GITHUB_APP_SLUG is not None
+                or self.GITHUB_WEBHOOK_SECRET is not None
+            )
+            if has_any_github_config:
+                if self.GITHUB_APP_ID is None:
+                    raise ValueError(
+                        "Production startup failure: GITHUB_APP_ID is required when GitHub App private key or integration settings are configured"
+                    )
+                pem_text = self.get_github_private_key_pem()
+                if pem_text is None:
+                    raise ValueError(
+                        "Production startup failure: A valid GitHub App private key (GITHUB_APP_PRIVATE_KEY or readable GITHUB_APP_PRIVATE_KEY_PATH) is required when GITHUB_APP_ID is set"
+                    )
+                try:
+                    _parse_github_pem(pem_text)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Production startup failure: Configured GitHub App private key is unusable: {exc}"
+                    ) from exc
+                if self.GITHUB_WEBHOOK_SECRET is None:
+                    raise ValueError(
+                        "Production startup failure: GITHUB_WEBHOOK_SECRET is required when GitHub App integration is enabled"
+                    )
+                if not self.GITHUB_APP_SLUG:
+                    raise ValueError(
+                        "Production startup failure: GITHUB_APP_SLUG is required when GitHub App integration is enabled"
+                    )
+
         return self
+
+    @model_validator(mode="after")
+    def validate_github_settings(self) -> Settings:
+        """Validate GitHub App configuration boundaries and secret hygiene."""
+        if self.GITHUB_APP_ID is not None and self.GITHUB_APP_ID <= 0:
+            raise ValueError("GITHUB_APP_ID must be a positive integer")
+
+        if (
+            isinstance(self.GITHUB_STATE_TTL_SEC, bool)
+            or self.GITHUB_STATE_TTL_SEC <= 0
+            or self.GITHUB_STATE_TTL_SEC > 3600
+        ):
+            raise ValueError("GITHUB_STATE_TTL_SEC must be between 1 and 3600 seconds")
+
+        if isinstance(self.GITHUB_CLIENT_TIMEOUT_SEC, bool) or self.GITHUB_CLIENT_TIMEOUT_SEC <= 0:
+            raise ValueError("GITHUB_CLIENT_TIMEOUT_SEC must be a positive number")
+
+        for secret_name, secret_val in (
+            ("GITHUB_WEBHOOK_SECRET", self.GITHUB_WEBHOOK_SECRET),
+            ("GITHUB_CLIENT_SECRET", self.GITHUB_CLIENT_SECRET),
+            ("GITHUB_APP_PRIVATE_KEY", self.GITHUB_APP_PRIVATE_KEY),
+        ):
+            if secret_val is not None and not secret_val.get_secret_value().strip():
+                raise ValueError(f"{secret_name} cannot be empty or whitespace-only")
+
+        if self.GITHUB_APP_PRIVATE_KEY is not None:
+            raw_pem = self.GITHUB_APP_PRIVATE_KEY.get_secret_value().replace("\\n", "\n").strip()
+            try:
+                _parse_github_pem(raw_pem)
+            except ValueError as exc:
+                raise ValueError(f"GITHUB_APP_PRIVATE_KEY is invalid: {exc}") from exc
+
+        if self.GITHUB_CLIENT_ID is not None:
+            cleaned_client_id = self.GITHUB_CLIENT_ID.strip()
+            if not cleaned_client_id or any(
+                ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned_client_id
+            ):
+                raise ValueError("GITHUB_CLIENT_ID cannot be empty or contain whitespace")
+            self.GITHUB_CLIENT_ID = cleaned_client_id
+
+        if (self.GITHUB_CLIENT_ID is not None) != (self.GITHUB_CLIENT_SECRET is not None):
+            raise ValueError(
+                "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must both be set when configuring GitHub OAuth"
+            )
+
+        if self.GITHUB_APP_SLUG is not None:
+            slug = self.GITHUB_APP_SLUG.strip()
+            if not slug or not _RE_GITHUB_SLUG.match(slug):
+                raise ValueError(
+                    "GITHUB_APP_SLUG must contain only alphanumeric characters and hyphens"
+                )
+            self.GITHUB_APP_SLUG = slug
+
+        require_https = self.APP_ENV == "production"
+        allowed_schemes = {"https"} if require_https else {"https", "http"}
+        self.GITHUB_API_BASE_URL = validate_github_base_url(
+            self.GITHUB_API_BASE_URL, name="GITHUB_API_BASE_URL", require_https=require_https
+        )
+        self.GITHUB_OAUTH_BASE_URL = validate_github_base_url(
+            self.GITHUB_OAUTH_BASE_URL, name="GITHUB_OAUTH_BASE_URL", require_https=require_https
+        )
+
+        if self.GITHUB_APP_INSTALL_CALLBACK_URL is not None:
+            callback_url = self.GITHUB_APP_INSTALL_CALLBACK_URL.strip()
+            parsed_cb = urlparse(callback_url)
+            if (
+                not callback_url
+                or parsed_cb.scheme not in allowed_schemes
+                or not parsed_cb.netloc
+                or parsed_cb.username is not None
+                or parsed_cb.password is not None
+                or parsed_cb.fragment
+                or any(ch.isspace() for ch in callback_url)
+            ):
+                raise ValueError(
+                    "GITHUB_APP_INSTALL_CALLBACK_URL must be a valid HTTP(S) URL without credentials or whitespace"
+                )
+            self.GITHUB_APP_INSTALL_CALLBACK_URL = callback_url
+
+        return self
+
+    def get_github_private_key_pem(self) -> str | None:
+        """Resolve configured GitHub App PEM private key from inline secret or readable file path."""
+        if self.GITHUB_APP_PRIVATE_KEY is not None:
+            raw = self.GITHUB_APP_PRIVATE_KEY.get_secret_value().replace("\\n", "\n").strip()
+            if raw:
+                return raw
+
+        if self.GITHUB_APP_PRIVATE_KEY_PATH is not None:
+            cleaned_path = self.GITHUB_APP_PRIVATE_KEY_PATH.strip()
+            if cleaned_path and "\x00" not in cleaned_path:
+                key_file = Path(cleaned_path)
+                try:
+                    if key_file.is_file() and key_file.stat().st_size <= 65_536:
+                        content = key_file.read_text(encoding="utf-8").strip()
+                        if content:
+                            return content
+                except (OSError, UnicodeDecodeError):
+                    return None
+
+        return None
+
+    def is_github_app_configured(self) -> bool:
+        """Return True when GitHub App ID and a valid parseable RSA PEM key are configured."""
+        if self.GITHUB_APP_ID is None:
+            return False
+        pem_text = self.get_github_private_key_pem()
+        if not pem_text:
+            return False
+        try:
+            _parse_github_pem(pem_text)
+        except ValueError:
+            return False
+        return True
+
+    def has_partial_github_config(self) -> bool:
+        """Return True when any GitHub setting is explicitly supplied."""
+        has_explicit_key_path = (
+            "GITHUB_APP_PRIVATE_KEY_PATH" in self.model_fields_set
+            and self.GITHUB_APP_PRIVATE_KEY_PATH is not None
+            and bool(self.GITHUB_APP_PRIVATE_KEY_PATH.strip())
+        )
+        return (
+            self.GITHUB_APP_ID is not None
+            or self.GITHUB_CLIENT_ID is not None
+            or self.GITHUB_CLIENT_SECRET is not None
+            or self.GITHUB_APP_PRIVATE_KEY is not None
+            or has_explicit_key_path
+            or self.GITHUB_APP_SLUG is not None
+            or self.GITHUB_WEBHOOK_SECRET is not None
+        )
+
+    def is_github_oauth_configured(self) -> bool:
+        """Return True when GitHub App OAuth client ID and secret are both configured."""
+        return (
+            self.GITHUB_CLIENT_ID is not None
+            and bool(self.GITHUB_CLIENT_ID.strip())
+            and self.GITHUB_CLIENT_SECRET is not None
+            and bool(self.GITHUB_CLIENT_SECRET.get_secret_value().strip())
+        )
+
+    def is_github_webhook_configured(self) -> bool:
+        """Return True when a non-empty GitHub webhook secret is configured."""
+        return self.GITHUB_WEBHOOK_SECRET is not None and bool(
+            self.GITHUB_WEBHOOK_SECRET.get_secret_value().strip()
+        )
+
+    def is_github_configured(self) -> bool:
+        """Return True when both GitHub App API authentication and webhook secret are configured."""
+        return self.is_github_app_configured() and self.is_github_webhook_configured()
+
+    def get_github_install_base_url(self) -> str | None:
+        """Return GitHub App public installation URL when slug is configured."""
+        if not self.GITHUB_APP_SLUG:
+            return None
+        return f"{self.GITHUB_OAUTH_BASE_URL}/apps/{self.GITHUB_APP_SLUG}/installations/new"
+
+
+def validate_github_base_url(raw_url: str, *, name: str, require_https: bool = False) -> str:
+    """Validate a GitHub API/OAuth base URL without credentials, query strings, fragments, or whitespace."""
+    if not isinstance(raw_url, str):
+        raise TypeError(f"{name} must be a URL string")
+
+    cleaned = raw_url.strip()
+    if (
+        not cleaned
+        or "\\" in cleaned
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+    ):
+        raise ValueError(f"{name} must be a valid URL without whitespace or control characters")
+
+    parsed = urlparse(cleaned)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{name} contains an invalid port") from exc
+
+    allowed_schemes = {"https"} if require_https else {"https", "http"}
+    segments = [seg for seg in parsed.path.split("/") if seg]
+    if (
+        parsed.scheme.lower() not in allowed_schemes
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(seg in (".", "..") for seg in segments)
+    ):
+        scheme_label = "an HTTPS" if require_https else "a valid HTTP(S)"
+        raise ValueError(
+            f"{name} must be {scheme_label} URL without credentials, query parameters, or fragments"
+        )
+    return cleaned.rstrip("/")
+
+
+_RE_GITHUB_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 
 
 _KNOWN_SECRET_PLACEHOLDERS: tuple[str, ...] = (
@@ -195,6 +446,16 @@ _KNOWN_SECRET_PLACEHOLDERS: tuple[str, ...] = (
     "example",
     "default-secret",
 )
+
+
+def _parse_github_pem(pem_text: str) -> None:
+    """Validate an RSA PEM key lazily to avoid a top-level import cycle with app.services."""
+    from app.services.github_crypto import GitHubKeyError, parse_rsa_private_key_pem
+
+    try:
+        parse_rsa_private_key_pem(pem_text)
+    except GitHubKeyError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _validate_production_secret(name: str, secret: SecretStr) -> None:

@@ -7,16 +7,19 @@ Mitigations T8 (Path safety) & T9 (Size limits and minified-file checks).
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.db.base import utc_now
 from app.db.models import Job, Project, Scan, User
 from app.domain.paths import normalize_and_validate_path
 from app.schemas.scan import ManualFileInput, ScanStatus, ScanTrigger
@@ -343,6 +346,177 @@ def create_manual_scan(
         created_by_user_id=created_by_user_id,
         auto_commit=auto_commit,
     )
+
+
+_RE_GIT_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_RE_GITHUB_FULL_NAME = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def create_github_pr_scan(
+    session: Session,
+    *,
+    project_id: uuid.UUID,
+    installation_id: int,
+    github_repo_id: int,
+    full_name: str,
+    pr_number: int,
+    head_sha: str,
+    base_sha: str | None = None,
+    pr_title: str | None = None,
+    trigger_key: str | None = None,
+    run_ai: bool = True,
+    now: datetime | None = None,
+    auto_commit: bool = False,
+) -> tuple[Scan, Job]:
+    """Enqueue an asynchronous pull-request scan and supersede stale active PR scans."""
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    else:
+        project = session.get(Project, project_id)
+
+    if project is None:
+        raise ProjectNotFoundError(f"Project with ID '{project_id}' does not exist")
+    if project.kind != "github" or project.deleted_at is not None or project.status != "active":
+        raise ScanValidationError("Target project is not an active GitHub-connected project")
+    if (
+        isinstance(installation_id, bool)
+        or isinstance(github_repo_id, bool)
+        or isinstance(pr_number, bool)
+        or installation_id <= 0
+        or github_repo_id <= 0
+        or pr_number <= 0
+    ):
+        raise ScanValidationError("Invalid GitHub installation, repository, or pull request ID")
+    if project.github_repo_id != github_repo_id:
+        raise ScanValidationError("Target project github_repo_id does not match webhook repository")
+    if (
+        project.installation is None
+        or project.installation.installation_id != installation_id
+        or project.installation.status != "active"
+    ):
+        raise ScanValidationError(
+            "Target project does not belong to the specified active GitHub installation"
+        )
+
+    cleaned_full_name = full_name.strip() if isinstance(full_name, str) else ""
+    if not _RE_GITHUB_FULL_NAME.match(cleaned_full_name):
+        raise ScanValidationError("Invalid pull request repository full_name")
+    owner_seg, repo_seg = cleaned_full_name.split("/", 1)
+    if owner_seg in (".", "..") or repo_seg in (".", ".."):
+        raise ScanValidationError("Invalid pull request repository full_name segments")
+
+    cleaned_head = head_sha.strip().lower()
+    if not _RE_GIT_SHA.match(cleaned_head):
+        raise ScanValidationError("Invalid pull request head_sha")
+    cleaned_base = base_sha.strip().lower() if base_sha else None
+    if cleaned_base is not None and not _RE_GIT_SHA.match(cleaned_base):
+        raise ScanValidationError("Invalid pull request base_sha")
+
+    effective_trigger_key = trigger_key or f"pr:{pr_number}:sha:{cleaned_head}"
+    existing_id = session.scalar(
+        select(Scan.id).where(
+            Scan.project_id == project_id,
+            Scan.trigger_key == effective_trigger_key,
+        )
+    )
+    if existing_id is not None:
+        raise ScanConflictError(
+            f"A scan with trigger key '{effective_trigger_key}' already exists for project '{project_id}'"
+        )
+
+    current_time = now if now is not None else utc_now()
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+
+    scan = Scan(
+        project_id=project_id,
+        created_by_user_id=None,
+        trigger="pull_request",
+        trigger_key=effective_trigger_key,
+        pr_number=pr_number,
+        head_sha=cleaned_head,
+        base_sha=cleaned_base,
+        pr_title=pr_title[:200] if pr_title else None,
+        status="queued",
+        report_status="pending",
+        files_summary=[],
+        queued_at=current_time,
+        created_at=current_time,
+    )
+    job = Job(
+        scan=scan,
+        type="github_pr_scan",
+        status="queued",
+        attempts=0,
+        max_attempts=3,
+        run_after=current_time,
+        payload={
+            "installation_id": installation_id,
+            "github_repo_id": github_repo_id,
+            "full_name": cleaned_full_name,
+            "pr_number": pr_number,
+            "head_sha": cleaned_head,
+            "base_sha": cleaned_base,
+            "run_ai": bool(run_ai),
+        },
+        created_at=current_time,
+        updated_at=current_time,
+    )
+
+    try:
+        with session.begin_nested():
+            # Supersede prior queued/running PR scans for the same PR with a different commit SHA
+            stale_scan_ids = list(
+                session.scalars(
+                    select(Scan.id).where(
+                        Scan.project_id == project_id,
+                        Scan.trigger == "pull_request",
+                        Scan.pr_number == pr_number,
+                        Scan.status.in_(("queued", "running")),
+                        sa.or_(Scan.head_sha.is_(None), Scan.head_sha != cleaned_head),
+                    )
+                ).all()
+            )
+            if stale_scan_ids:
+                session.execute(
+                    update(Scan)
+                    .where(Scan.id.in_(stale_scan_ids), Scan.status.in_(("queued", "running")))
+                    .values(status="superseded", finished_at=current_time)
+                )
+                session.execute(
+                    update(Job)
+                    .where(Job.scan_id.in_(stale_scan_ids), Job.status == "queued")
+                    .values(
+                        status="failed",
+                        last_error="Superseded by newer pull request commit",
+                        payload=None,
+                        updated_at=current_time,
+                    )
+                )
+            session.add(scan)
+            session.add(job)
+            session.flush()
+        if auto_commit:
+            session.commit()
+    except IntegrityError as exc:
+        if _is_trigger_key_conflict(exc):
+            raise ScanConflictError(
+                f"A scan with trigger key '{effective_trigger_key}' already exists for project '{project_id}'"
+            ) from exc
+        if _is_foreign_key_violation(exc):
+            raise ScanValidationError(
+                "Foreign key constraint violation: referenced project does not exist"
+            ) from exc
+        raise ScanServiceError(
+            "Database integrity error creating pull request scan and job"
+        ) from exc
+    except Exception as exc:
+        raise ScanServiceError(
+            "Unexpected database error creating pull request scan and job"
+        ) from exc
+
+    return scan, job
 
 
 def get_scan(session: Session, scan_id: uuid.UUID) -> Scan | None:
