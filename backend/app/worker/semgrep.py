@@ -402,7 +402,12 @@ class SemgrepScannerAdapter(ScannerInterface):
         self.runner = runner
         self.workspace_base_dir = workspace_base_dir
 
-    def scan(self, payload: ScanJobPayload) -> ScanExecutionResult:
+    def scan(
+        self,
+        payload: ScanJobPayload,
+        *,
+        workspace: StagedWorkspace | None = None,
+    ) -> ScanExecutionResult:
         """Execute Semgrep analysis over submitted files and return structured results."""
         # 1. Check for scannable files
         scannable_files = [f for f in payload.files if f.scanned]
@@ -455,21 +460,65 @@ class SemgrepScannerAdapter(ScannerInterface):
                 components={"semgrep": "failed"},
             )
 
-        # 5. Execute analysis inside ephemeral StagedWorkspace
-        try:
-            with StagedWorkspace(payload.files, base_dir=self.workspace_base_dir) as workspace:
+        # 5. Execute analysis using caller-provided workspace or an ephemeral StagedWorkspace
+        if workspace is not None:
+            if not isinstance(workspace, StagedWorkspace) or workspace._cleaned_up:
+                return ScanExecutionResult(
+                    status=ScanStatus.FAILED,
+                    error_code="SEMGREP_EXECUTION_ERROR",
+                    error_message="Provided staged workspace is invalid or already cleaned up",
+                    retryable=False,
+                    components={"semgrep": "failed"},
+                )
+            try:
+                if not workspace.staged_files:
+                    return ScanExecutionResult(
+                        status=ScanStatus.SUCCEEDED,
+                        components={"semgrep": "passed"},
+                        counts={
+                            "findings": 0,
+                            "critical": 0,
+                            "high": 0,
+                            "medium": 0,
+                            "low": 0,
+                            "info": 0,
+                        },
+                        findings=[],
+                    )
                 return self._execute_and_normalize(
                     workspace=workspace,
                     payload=payload,
                     executable=resolved_exec,
                     rules_path=rules_path_obj,
                 )
+            except Exception as exc:  # noqa: BLE001 - catch unexpected scanner crash to report failed result
+                exc_name = type(exc).__name__
+                logger.error("Semgrep scan execution failed unexpectedly: %s", exc_name)
+                return ScanExecutionResult(
+                    status=ScanStatus.FAILED,
+                    error_code="SEMGREP_EXECUTION_ERROR",
+                    error_message=f"Semgrep staging or execution failure ({exc_name})",
+                    retryable=False,
+                    components={"semgrep": "failed"},
+                )
+
+        try:
+            with StagedWorkspace(
+                payload.files, base_dir=self.workspace_base_dir
+            ) as owned_workspace:
+                return self._execute_and_normalize(
+                    workspace=owned_workspace,
+                    payload=payload,
+                    executable=resolved_exec,
+                    rules_path=rules_path_obj,
+                )
         except Exception as exc:  # noqa: BLE001 - catch unexpected staging or scanner crash to report failed result
-            logger.error("Semgrep scan execution failed unexpectedly: %s", exc)
+            exc_name = type(exc).__name__
+            logger.error("Semgrep scan execution failed unexpectedly: %s", exc_name)
             return ScanExecutionResult(
                 status=ScanStatus.FAILED,
                 error_code="SEMGREP_EXECUTION_ERROR",
-                error_message=f"Semgrep staging or execution failure: {exc}",
+                error_message=f"Semgrep staging or execution failure ({exc_name})",
                 retryable=False,
                 components={"semgrep": "failed"},
             )

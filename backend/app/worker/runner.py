@@ -6,6 +6,7 @@ and Threat Mitigations T2 (Subprocess isolation) and T13 (Worker concurrency).
 
 from __future__ import annotations
 
+import inspect
 import logging
 import signal
 import threading
@@ -15,7 +16,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Self
 
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -44,6 +45,27 @@ from app.worker.scanner import (
 )
 
 logger = logging.getLogger("sentinel.worker")
+
+
+def _scanner_supports_cancel_event(scanner: ScannerInterface) -> bool:
+    """Return True if scanner.scan accepts a `cancel_event` keyword argument."""
+    try:
+        sig = inspect.signature(scanner.scan)
+    except (TypeError, ValueError):
+        return False
+
+    return any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            param.name == "cancel_event"
+            and param.kind
+            in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
+        for param in sig.parameters.values()
+    )
 
 
 class JobHeartbeat:
@@ -77,6 +99,7 @@ class JobHeartbeat:
         lease_extension_sec: int,
         initial_locked_until: datetime | None = None,
         worker_stop_event: threading.Event | None = None,
+        scan_cancel_event: threading.Event | None = None,
         shutdown_timeout_sec: float = 2.0,
     ) -> None:
         self.session_factory = session_factory
@@ -86,6 +109,7 @@ class JobHeartbeat:
         self.lease_extension_sec = lease_extension_sec
         self.last_known_locked_until: datetime | None = _normalize_datetime(initial_locked_until)
         self.worker_stop_event = worker_stop_event
+        self.scan_cancel_event = scan_cancel_event or threading.Event()
         self.shutdown_timeout_sec = shutdown_timeout_sec
 
         self._stop_event = threading.Event()
@@ -171,6 +195,11 @@ class JobHeartbeat:
                         now=current_time,
                         auto_commit=False,
                     )
+                    renewed_scan = getattr(renewed, "scan", None)
+                    renewed_scan_status: str | None = (
+                        getattr(renewed_scan, "status", None) if renewed_scan is not None else None
+                    )
+                    renewed_locked_until = _normalize_datetime(renewed.locked_until)
 
                     # Synchronized pre-commit decision and commit execution:
                     # Holds _lock to ensure stop() cannot interleave between the stop check
@@ -191,10 +220,12 @@ class JobHeartbeat:
 
                         session.commit()
 
-                        self.last_known_locked_until = _normalize_datetime(renewed.locked_until)
+                        self.last_known_locked_until = renewed_locked_until
                         self.consecutive_transient_failures = 0
                         self.last_transient_error = None
                         self.successful_renewals += 1
+                        if renewed_scan_status in ("canceled", "superseded"):
+                            self.scan_cancel_event.set()
 
                     logger.debug(
                         "Heartbeat extended lease for job %s until %s (worker: %s)",
@@ -522,6 +553,20 @@ class JobWorker:
                     logger.warning("Job %s lease expired before processing started", job_id)
                     return job
 
+            if job.scan is not None and job.scan.status in ("canceled", "superseded"):
+                logger.info(
+                    "Job %s skipped scanner execution because scan %s is already '%s'",
+                    job_id,
+                    job.scan.id,
+                    job.scan.status,
+                )
+                return self._finalize_canceled_scan_job(
+                    session=session,
+                    job_id=job_id,
+                    scan_status=job.scan.status,
+                    current_time=start_time,
+                )
+
             job_type = job.type
             raw_payload = job.payload
             initial_locked_until = job.locked_until
@@ -564,6 +609,7 @@ class JobWorker:
         # Phase 2: Execute scanner completely outside any database session or connection
         # Scoped background heartbeat periodically renews the lease for long-running scans
         scan_result: ScanExecutionResult
+        scan_cancel_event = threading.Event()
         heartbeat = JobHeartbeat(
             session_factory=self.session_factory,
             job_id=job_id,
@@ -572,11 +618,18 @@ class JobWorker:
             lease_extension_sec=self.lease_duration_sec,
             initial_locked_until=initial_locked_until,
             worker_stop_event=self._stop_event,
+            scan_cancel_event=scan_cancel_event,
             shutdown_timeout_sec=self.heartbeat_shutdown_timeout_sec,
         )
         try:
             with heartbeat:
-                scan_result = self.scanner.scan(payload)
+                if _scanner_supports_cancel_event(self.scanner):
+                    scan_result = self.scanner.scan(  # type: ignore[call-arg]
+                        payload,
+                        cancel_event=scan_cancel_event,
+                    )
+                else:
+                    scan_result = self.scanner.scan(payload)
         except Exception as exc:  # noqa: BLE001 - catch unexpected scanner crashes to fail job
             # If heartbeat failed to terminate cleanly or renewal is in-flight, fail closed without updating DB
             if heartbeat.is_alive or heartbeat.is_renewal_in_flight or not heartbeat.clean_shutdown:
@@ -608,16 +661,18 @@ class JobWorker:
             sanitized_exc = sanitize_failure_message(str(exc))
             logger.error("Job %s scanner execution raised error: %s", job_id, sanitized_exc)
             fail_time = completion_now or utc_now()
+            crash_result = ScanExecutionResult(
+                status=ScanStatus.FAILED,
+                error_code="SCANNER_EXECUTION_ERROR",
+                error_message=f"Scanner execution failed: {sanitized_exc}",
+                retryable=False,
+            )
             with session_scope(self.session_factory) as session:
-                return fail_job(
-                    session,
+                return self._handle_scan_result(
+                    session=session,
                     job_id=job_id,
-                    worker_id=self.worker_id,
-                    error_message=f"Scanner execution failed: {sanitized_exc}",
-                    error_code="SCANNER_EXECUTION_ERROR",
-                    retryable=False,
-                    now=fail_time,
-                    auto_commit=True,
+                    scan_result=crash_result,
+                    current_time=fail_time,
                 )
 
         finished_time = completion_now or utc_now()
@@ -661,6 +716,44 @@ class JobWorker:
                 current_time=finished_time,
             )
 
+    def _finalize_canceled_scan_job(
+        self,
+        *,
+        session: Session,
+        job_id: uuid.UUID,
+        scan_status: str,
+        current_time: datetime,
+    ) -> Job:
+        """Release a claimed job whose scan was canceled/superseded without overwriting scan state."""
+        stmt = (
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.status == "running",
+                Job.locked_by == self.worker_id,
+                Job.locked_until >= current_time,
+            )
+            .values(
+                status="failed",
+                locked_by=None,
+                locked_until=None,
+                payload=None,
+                last_error=sanitize_failure_message(
+                    f"Aborted job because scan status is '{scan_status}'"
+                ),
+                updated_at=current_time,
+            )
+            .returning(Job)
+            .execution_options(synchronize_session="fetch")
+        )
+        finalized = session.scalars(stmt).first()
+        if finalized is None:
+            raise JobInvalidStateError(
+                f"Job '{job_id}' could not be finalized after scan cancellation due to concurrent state change"
+            )
+        session.commit()
+        return finalized
+
     def _handle_scan_result(
         self,
         *,
@@ -670,6 +763,24 @@ class JobWorker:
         current_time: datetime,
     ) -> Job:
         """Route the structured scanner execution result to job and scan state."""
+        existing_job = session.get(Job, job_id)
+        if (
+            existing_job is not None
+            and existing_job.scan is not None
+            and existing_job.scan.status in ("canceled", "superseded")
+        ):
+            logger.info(
+                "Job %s discarding scanner results because scan %s is '%s'",
+                job_id,
+                existing_job.scan.id,
+                existing_job.scan.status,
+            )
+            return self._finalize_canceled_scan_job(
+                session=session,
+                job_id=job_id,
+                scan_status=existing_job.scan.status,
+                current_time=current_time,
+            )
 
         if scan_result.status in (ScanStatus.SUCCEEDED, ScanStatus.PARTIAL):
             scan_terminal_status = (
@@ -758,6 +869,18 @@ class JobWorker:
                     sanitized_exc,
                 )
                 with session_scope(self.session_factory) as fail_session:
+                    check_job = fail_session.get(Job, job_id)
+                    if (
+                        check_job is not None
+                        and check_job.scan is not None
+                        and check_job.scan.status in ("canceled", "superseded")
+                    ):
+                        return self._finalize_canceled_scan_job(
+                            session=fail_session,
+                            job_id=job_id,
+                            scan_status=check_job.scan.status,
+                            current_time=current_time,
+                        )
                     return fail_job(
                         fail_session,
                         job_id=job_id,

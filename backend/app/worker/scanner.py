@@ -8,6 +8,8 @@ Blueprint Section 7 (Worker process and queue polling), Section 10
 
 from __future__ import annotations
 
+import inspect
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -72,10 +74,28 @@ class DefaultScannerEngine:
     an unsafe host scanner.
     """
 
-    def __init__(self, *, sandbox_available: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        sandbox_available: bool = False,
+        scanner: ScannerInterface | None = None,
+    ) -> None:
         self.sandbox_available = sandbox_available
+        self._delegated_scanner = scanner
 
-    def scan(self, payload: ScanJobPayload) -> ScanExecutionResult:
+    def _get_delegated_scanner(self) -> ScannerInterface:
+        if self._delegated_scanner is None:
+            from app.worker.composite import CompositeScannerEngine
+
+            self._delegated_scanner = CompositeScannerEngine()
+        return self._delegated_scanner
+
+    def scan(
+        self,
+        payload: ScanJobPayload,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> ScanExecutionResult:
         """Scan submitted files only if enforceable isolation is available."""
         if not self.sandbox_available:
             return ScanExecutionResult(
@@ -88,11 +108,27 @@ class DefaultScannerEngine:
                 retryable=False,
             )
 
-        return ScanExecutionResult(
-            status=ScanStatus.SUCCEEDED,
-            components={"sandbox": "enforced"},
-            counts={"findings": 0},
-        )
+        delegated = self._get_delegated_scanner()
+        try:
+            sig = inspect.signature(delegated.scan)
+            accepts_cancel = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                or (
+                    p.name == "cancel_event"
+                    and p.kind
+                    in (
+                        inspect.Parameter.KEYWORD_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                )
+                for p in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_cancel = False
+
+        if cancel_event is not None and accepts_cancel:
+            return delegated.scan(payload, cancel_event=cancel_event)  # type: ignore[call-arg]
+        return delegated.scan(payload)
 
 
 class CallableScannerEngine:

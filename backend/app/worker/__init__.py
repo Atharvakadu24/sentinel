@@ -4,6 +4,7 @@ Implements Blueprint Section 7 (Worker process and queue polling),
 Section 8.1 (Job queue mechanics), and Threat Mitigations T2 & T13.
 """
 
+from app.worker.composite import DEFAULT_SCANNER_ORDER, CompositeScannerEngine
 from app.worker.gitleaks import (
     GitleaksError,
     GitleaksExecutionError,
@@ -49,11 +50,13 @@ from app.worker.subprocess_runner import (
 )
 
 __all__ = [
+    "DEFAULT_SCANNER_ORDER",
     "CallableScannerEngine",
     "CommandNotFoundError",
     "CommandResult",
     "CommandStatus",
     "CommandTimeoutError",
+    "CompositeScannerEngine",
     "DefaultScannerEngine",
     "GitleaksError",
     "GitleaksExecutionError",

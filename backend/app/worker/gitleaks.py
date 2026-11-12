@@ -1447,7 +1447,12 @@ class GitleaksScannerAdapter(ScannerInterface):
             except ValueError:
                 self.fingerprint_key = settings.FINGERPRINT_KEY.get_secret_value()
 
-    def scan(self, payload: ScanJobPayload) -> ScanExecutionResult:
+    def scan(
+        self,
+        payload: ScanJobPayload,
+        *,
+        workspace: StagedWorkspace | None = None,
+    ) -> ScanExecutionResult:
         """Execute Gitleaks analysis over submitted files and return structured results."""
         # 1. Check for scannable files
         scannable_files = [f for f in payload.files if f.scanned]
@@ -1515,13 +1520,23 @@ class GitleaksScannerAdapter(ScannerInterface):
                 )
             resolved_exec = self.executable_path
 
-        # 5. Execute analysis inside ephemeral StagedWorkspace while excluding untrusted repo Gitleaks control files
-        try:
-            with StagedWorkspace(
-                payload.files,
-                base_dir=self.workspace_base_dir,
-                exclude_filenames=_UNTRUSTED_REPO_CONTROL_FILENAMES,
-            ) as workspace:
+        # 5. Execute analysis using validated shared workspace or ephemeral StagedWorkspace
+        if workspace is not None:
+            if (
+                not isinstance(workspace, StagedWorkspace)
+                or workspace._cleaned_up
+                or not _UNTRUSTED_REPO_CONTROL_FILENAMES.issubset(workspace._excluded_filenames)
+            ):
+                return ScanExecutionResult(
+                    status=ScanStatus.FAILED,
+                    error_code="GITLEAKS_EXECUTION_ERROR",
+                    error_message=(
+                        "Shared staged workspace must be active and exclude untrusted Gitleaks control files"
+                    ),
+                    retryable=False,
+                    components={"gitleaks": "failed"},
+                )
+            try:
                 if not workspace.staged_files:
                     return ScanExecutionResult(
                         status=ScanStatus.SUCCEEDED,
@@ -1538,6 +1553,46 @@ class GitleaksScannerAdapter(ScannerInterface):
                     )
                 return self._execute_and_normalize(
                     workspace=workspace,
+                    payload=payload,
+                    executable=resolved_exec,
+                    key_bytes=validated_key,
+                    config_bytes=validated_config_bytes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Gitleaks scan execution failed unexpectedly: %s",
+                    type(exc).__name__,
+                )
+                return ScanExecutionResult(
+                    status=ScanStatus.FAILED,
+                    error_code="GITLEAKS_EXECUTION_ERROR",
+                    error_message="Gitleaks staging or execution failure",
+                    retryable=False,
+                    components={"gitleaks": "failed"},
+                )
+
+        try:
+            with StagedWorkspace(
+                payload.files,
+                base_dir=self.workspace_base_dir,
+                exclude_filenames=_UNTRUSTED_REPO_CONTROL_FILENAMES,
+            ) as owned_workspace:
+                if not owned_workspace.staged_files:
+                    return ScanExecutionResult(
+                        status=ScanStatus.SUCCEEDED,
+                        components={"gitleaks": "passed"},
+                        counts={
+                            "findings": 0,
+                            "critical": 0,
+                            "high": 0,
+                            "medium": 0,
+                            "low": 0,
+                            "info": 0,
+                        },
+                        findings=[],
+                    )
+                return self._execute_and_normalize(
+                    workspace=owned_workspace,
                     payload=payload,
                     executable=resolved_exec,
                     key_bytes=validated_key,
