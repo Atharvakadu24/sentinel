@@ -69,9 +69,11 @@ class Settings(BaseSettings):
     GITHUB_APP_PRIVATE_KEY: SecretStr | None = None
     GITHUB_APP_SLUG: str | None = None
     GITHUB_APP_INSTALL_CALLBACK_URL: str | None = None
+    GITHUB_AUTH_CALLBACK_URL: str | None = None
     GITHUB_API_BASE_URL: str = "https://api.github.com"
     GITHUB_OAUTH_BASE_URL: str = "https://github.com"
     GITHUB_STATE_TTL_SEC: int = 600
+    SESSION_TTL_SEC: int = 86_400
     GITHUB_CLIENT_TIMEOUT_SEC: float = 15.0
 
     # AI Review & LLM
@@ -294,7 +296,6 @@ class Settings(BaseSettings):
             self.GITHUB_APP_SLUG = slug
 
         require_https = self.APP_ENV == "production"
-        allowed_schemes = {"https"} if require_https else {"https", "http"}
         self.GITHUB_API_BASE_URL = validate_github_base_url(
             self.GITHUB_API_BASE_URL, name="GITHUB_API_BASE_URL", require_https=require_https
         )
@@ -302,22 +303,25 @@ class Settings(BaseSettings):
             self.GITHUB_OAUTH_BASE_URL, name="GITHUB_OAUTH_BASE_URL", require_https=require_https
         )
 
-        if self.GITHUB_APP_INSTALL_CALLBACK_URL is not None:
-            callback_url = self.GITHUB_APP_INSTALL_CALLBACK_URL.strip()
-            parsed_cb = urlparse(callback_url)
-            if (
-                not callback_url
-                or parsed_cb.scheme not in allowed_schemes
-                or not parsed_cb.netloc
-                or parsed_cb.username is not None
-                or parsed_cb.password is not None
-                or parsed_cb.fragment
-                or any(ch.isspace() for ch in callback_url)
-            ):
-                raise ValueError(
-                    "GITHUB_APP_INSTALL_CALLBACK_URL must be a valid HTTP(S) URL without credentials or whitespace"
-                )
-            self.GITHUB_APP_INSTALL_CALLBACK_URL = callback_url
+        for field_name in (
+            "GITHUB_APP_INSTALL_CALLBACK_URL",
+            "GITHUB_AUTH_CALLBACK_URL",
+        ):
+            raw_url = getattr(self, field_name)
+            if raw_url is None:
+                continue
+            setattr(
+                self,
+                field_name,
+                validate_github_base_url(
+                    raw_url,
+                    name=field_name,
+                    require_https=require_https,
+                ),
+            )
+
+        if isinstance(self.SESSION_TTL_SEC, bool) or not (60 <= self.SESSION_TTL_SEC <= 2_592_000):
+            raise ValueError("SESSION_TTL_SEC must be between 60 and 2592000 seconds")
 
         return self
 

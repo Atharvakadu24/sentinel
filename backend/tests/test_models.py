@@ -62,6 +62,7 @@ class TestModelDefinitions:
         expected_tables = {
             "users",
             "user_sessions",
+            "auth_login_states",
             "github_installations",
             "github_install_states",
             "projects",

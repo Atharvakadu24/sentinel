@@ -38,9 +38,7 @@ class User(Base, UUIDPrimaryKeyMixin):
     last_login_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
-    deleted_at: Mapped[datetime | None] = mapped_column(
-        sa.DateTime(timezone=True), nullable=True
-    )
+    deleted_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
 
     # Relationships
     sessions: Mapped[list[UserSession]] = relationship(
@@ -79,12 +77,41 @@ class UserSession(Base, UUIDPrimaryKeyMixin):
     expires_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, index=True
     )
-    last_used_at: Mapped[datetime | None] = mapped_column(
-        sa.DateTime(timezone=True), nullable=True
-    )
-    revoked_at: Mapped[datetime | None] = mapped_column(
-        sa.DateTime(timezone=True), nullable=True
-    )
+    last_used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
 
     # Relationships
     user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class AuthLoginState(UUIDPrimaryKeyMixin, Base):
+    """Single-use expiring CSRF/state nonce for GitHub OAuth user login callbacks."""
+
+    __tablename__ = "auth_login_states"
+
+    state_hash: Mapped[str] = mapped_column(sa.Text(), unique=True, nullable=False)
+    tx_nonce_hash: Mapped[bytes] = mapped_column(sa.LargeBinary(32), nullable=False)
+    purpose: Mapped[str] = mapped_column(
+        sa.Text(),
+        nullable=False,
+        default="github_oauth_login",
+        server_default="github_oauth_login",
+    )
+    redirect_uri: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    next_path: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        server_default=sa.func.now(),
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "purpose = 'github_oauth_login'",
+            name="ck_auth_login_states_purpose",
+        ),
+        sa.Index("ix_auth_login_states_expires_at", "expires_at"),
+    )

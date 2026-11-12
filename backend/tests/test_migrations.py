@@ -50,6 +50,7 @@ def test_offline_migration_sql_generation() -> None:
         "CREATE TABLE webhook_events",
         "CREATE TABLE ai_reviews",
         "CREATE TABLE github_install_states",
+        "CREATE TABLE auth_login_states",
     ]
 
     for expected in expected_tables:
@@ -68,6 +69,7 @@ def test_offline_downgrade_sql_generation() -> None:
     assert len(generated_sql) > 0
 
     expected_drops = [
+        "DROP TABLE auth_login_states;",
         "DROP TABLE github_install_states;",
         "DROP TABLE ai_reviews;",
         "DROP TABLE webhook_events;",
@@ -129,6 +131,7 @@ def test_disposable_infrastructure_migration_lifecycle() -> None:
             "webhook_events",
             "ai_reviews",
             "github_install_states",
+            "auth_login_states",
             "alembic_version",
         }
         assert expected_tables.issubset(tables)

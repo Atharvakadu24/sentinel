@@ -259,3 +259,33 @@ class TestSettings:
         valid = Settings(WORKER_JOB_LEASE_SEC=120, WORKER_HEARTBEAT_SEC=30)
         assert valid.WORKER_JOB_LEASE_SEC == 120
         assert valid.WORKER_HEARTBEAT_SEC == 30
+
+    def test_github_callback_urls_and_session_ttl_validation(self) -> None:
+        """GitHub OAuth/install callback URLs and SESSION_TTL_SEC enforce strict bounds."""
+        for bad_cb in (
+            "",
+            "   ",
+            "https://:443/callback",
+            "https://sentinel.example.com:99999/auth/github/callback",
+            "https://sentinel.example.com/auth/github/callback?foo=bar",
+            "https://sentinel.example.com/auth/github/callback#frag",
+            "https://user:pass@sentinel.example.com/auth/github/callback",
+            "https://sentinel.example.com/auth/../callback",
+            "https://sentinel.example.com\\auth\\callback",
+        ):
+            with pytest.raises(ValidationError):
+                Settings(GITHUB_AUTH_CALLBACK_URL=bad_cb)
+            with pytest.raises(ValidationError):
+                Settings(GITHUB_APP_INSTALL_CALLBACK_URL=bad_cb)
+
+        for bad_ttl in (0, -60, 59, 2_592_001):
+            with pytest.raises(ValidationError, match="SESSION_TTL_SEC"):
+                Settings(SESSION_TTL_SEC=bad_ttl)
+
+        valid = Settings(
+            GITHUB_AUTH_CALLBACK_URL="https://sentinel.example.com/auth/github/callback",
+            GITHUB_APP_INSTALL_CALLBACK_URL="https://sentinel.example.com/integrations/github/callback",
+            SESSION_TTL_SEC=3600,
+        )
+        assert valid.GITHUB_AUTH_CALLBACK_URL == "https://sentinel.example.com/auth/github/callback"
+        assert valid.SESSION_TTL_SEC == 3600

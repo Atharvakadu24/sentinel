@@ -202,6 +202,43 @@ class GitHubOAuthUser:
 
     id: int
     login: str
+    name: str | None = None
+    avatar_url: str | None = None
+
+
+def _parse_optional_display_name(raw_name: object) -> str | None:
+    if not isinstance(raw_name, str):
+        return None
+    cleaned = raw_name.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 255
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+    ):
+        return None
+    return cleaned
+
+
+def _parse_optional_avatar_url(raw_url: object) -> str | None:
+    if not isinstance(raw_url, str):
+        return None
+    cleaned = raw_url.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 1000
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+    ):
+        return None
+    parsed = urlparse(cleaned)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        return None
+    return cleaned
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,14 +434,19 @@ def _parse_next_link(
     return None
 
 
-class GitHubAppClient:
-    """Synchronous GitHub App REST API client for backend services and worker jobs."""
+class _DefaultRedirectUriType:
+    """Sentinel distinguishing omitted redirect_uri from an explicit None."""
+
+
+_DEFAULT_REDIRECT_URI = _DefaultRedirectUriType()
+
+
+class GitHubOAuthClient:
+    """Synchronous GitHub OAuth REST API client for user login and OAuth identity lookup."""
 
     def __init__(
         self,
         *,
-        app_id: int,
-        private_key: RSAPrivateKey,
         base_url: str = "https://api.github.com",
         oauth_base_url: str = "https://github.com",
         client_id: str | None = None,
@@ -418,9 +460,6 @@ class GitHubAppClient:
         now_fn: Callable[[], datetime] = _utc_now,
         sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
-        if app_id <= 0:
-            raise GitHubConfigurationError("GitHub App ID must be a positive integer")
-
         if require_https is None:
             env_app_env = os.environ.get("APP_ENV")
             if env_app_env is not None:
@@ -449,8 +488,6 @@ class GitHubAppClient:
 
         parsed_base = urlparse(normalized_base)
 
-        self.app_id = app_id
-        self._private_key = private_key
         self.base_url = normalized_base
         self._oauth_base_url = normalized_oauth_base
         self._client_id = client_id.strip() if client_id and client_id.strip() else None
@@ -470,10 +507,6 @@ class GitHubAppClient:
         self._now_fn = now_fn
         self._sleep_fn = sleep_fn
 
-        self._token_lock = threading.Lock()
-        self._token_cache: dict[int, _CachedInstallationToken] = {}
-        self._refresh_locks: dict[int, threading.Lock] = {}
-
         client_kwargs: dict[str, Any] = {
             "base_url": normalized_base,
             "timeout": httpx.Timeout(timeout_sec),
@@ -489,44 +522,34 @@ class GitHubAppClient:
         self._client = httpx.Client(**client_kwargs)
 
     def __repr__(self) -> str:
-        return f"GitHubAppClient(app_id={self.app_id!r}, base_url={self.base_url!r})"
+        return f"GitHubOAuthClient(base_url={self.base_url!r})"
 
     __str__ = __repr__
 
     @classmethod
-    def from_settings(
+    def from_oauth_settings(
         cls,
         settings: Settings,
         *,
         transport: httpx.BaseTransport | None = None,
         now_fn: Callable[[], datetime] = _utc_now,
         sleep_fn: Callable[[float], None] = time.sleep,
-    ) -> GitHubAppClient:
-        """Construct a configured GitHubAppClient from validated application Settings."""
-        if settings.GITHUB_APP_ID is None:
-            raise GitHubConfigurationError("GITHUB_APP_ID is not configured")
-
-        pem_text = settings.get_github_private_key_pem()
-        if not pem_text:
-            raise GitHubConfigurationError("GitHub App private key is not configured or unreadable")
-
-        try:
-            private_key = parse_rsa_private_key_pem(pem_text)
-        except GitHubKeyError as exc:
-            raise GitHubConfigurationError(f"Invalid GitHub App private key: {exc}") from exc
-
+    ) -> GitHubOAuthClient:
+        """Construct a GitHubOAuthClient from OAuth settings without requiring App ID/PEM key."""
+        if (
+            not settings.is_github_oauth_configured()
+            or settings.GITHUB_CLIENT_ID is None
+            or settings.GITHUB_CLIENT_SECRET is None
+        ):
+            raise GitHubConfigurationError(
+                "GitHub OAuth client credentials (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET) are not configured"
+            )
         return cls(
-            app_id=settings.GITHUB_APP_ID,
-            private_key=private_key,
             base_url=settings.GITHUB_API_BASE_URL,
             oauth_base_url=settings.GITHUB_OAUTH_BASE_URL,
             client_id=settings.GITHUB_CLIENT_ID,
-            client_secret=(
-                settings.GITHUB_CLIENT_SECRET.get_secret_value()
-                if settings.GITHUB_CLIENT_SECRET is not None
-                else None
-            ),
-            oauth_redirect_uri=settings.GITHUB_APP_INSTALL_CALLBACK_URL,
+            client_secret=settings.GITHUB_CLIENT_SECRET.get_secret_value(),
+            oauth_redirect_uri=settings.GITHUB_AUTH_CALLBACK_URL,
             require_https=(settings.APP_ENV == "production"),
             timeout_sec=settings.GITHUB_CLIENT_TIMEOUT_SEC,
             transport=transport,
@@ -542,33 +565,6 @@ class GitHubAppClient:
 
     def __exit__(self, *args: object) -> None:
         self.close()
-
-    def clear_token_cache(self, installation_id: int | None = None) -> None:
-        """Clear cached in-memory installation token(s)."""
-        with self._token_lock:
-            if installation_id is None:
-                self._token_cache.clear()
-            else:
-                self._token_cache.pop(installation_id, None)
-
-    def _get_refresh_lock(self, installation_id: int) -> threading.Lock:
-        with self._token_lock:
-            lock = self._refresh_locks.get(installation_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._refresh_locks[installation_id] = lock
-            return lock
-
-    def _invalidate_installation_token(self, installation_id: int, failed_token: str) -> None:
-        """Evict cached token only if it matches the exact token rejected with 401."""
-        with self._token_lock:
-            cached = self._token_cache.get(installation_id)
-            if cached is not None and cached.token == failed_token:
-                self._token_cache.pop(installation_id, None)
-
-    def _create_app_jwt(self) -> str:
-        now_ts = int(self._now_fn().timestamp())
-        return create_github_app_jwt(self.app_id, self._private_key, now=now_ts)
 
     def _read_bounded_response(
         self,
@@ -725,6 +721,297 @@ class GitHubAppClient:
                 retryable=False,
             )
 
+    def _resolve_redirect_uri(
+        self,
+        redirect_uri: str | None | _DefaultRedirectUriType,
+    ) -> str | None:
+        if isinstance(redirect_uri, _DefaultRedirectUriType):
+            return self._oauth_redirect_uri
+        if redirect_uri is None:
+            return None
+        cleaned = redirect_uri.strip()
+        return cleaned or None
+
+    def exchange_oauth_code(
+        self,
+        code: str,
+        *,
+        redirect_uri: str | None | _DefaultRedirectUriType = _DEFAULT_REDIRECT_URI,
+    ) -> str:
+        """Exchange a single-use GitHub OAuth authorization code for a user access token."""
+        if not self._client_id or not self._client_secret:
+            raise GitHubConfigurationError(
+                "GitHub OAuth client credentials (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET) are not configured"
+            )
+
+        cleaned_code = code.strip()
+        if (
+            not cleaned_code
+            or len(cleaned_code) > 512
+            or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned_code)
+        ):
+            raise GitHubOAuthError("Invalid GitHub OAuth authorization code", status_code=403)
+
+        form_fields: dict[str, str] = {
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "code": cleaned_code,
+        }
+        effective_redirect_uri = self._resolve_redirect_uri(redirect_uri)
+        if effective_redirect_uri:
+            form_fields["redirect_uri"] = effective_redirect_uri
+
+        body_bytes = urlencode(form_fields).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        token_url = f"{self._oauth_base_url}/login/oauth/access_token"
+
+        try:
+            with self._client.stream(
+                "POST", token_url, content=body_bytes, headers=headers
+            ) as resp:
+                response = self._read_bounded_response(resp, max_bytes=MAX_ERROR_RESPONSE_BYTES)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise GitHubTransientError(
+                f"GitHub OAuth token exchange transport error: {exc}"
+            ) from exc
+
+        if response.status_code == 429:
+            retry_after_sec, reset_at = _parse_retry_after(response, now=self._now_fn())
+            raise GitHubRateLimitError(
+                "GitHub OAuth token exchange rate limit exceeded",
+                status_code=429,
+                retry_after_sec=retry_after_sec,
+                reset_at=reset_at,
+            )
+        if response.status_code >= 500:
+            raise GitHubTransientError(
+                f"GitHub OAuth token exchange upstream error ({response.status_code})",
+                status_code=response.status_code,
+            )
+        if response.status_code in (401, 403):
+            raise GitHubOAuthError("GitHub OAuth token exchange was rejected", status_code=403)
+        if not (200 <= response.status_code < 300):
+            raise GitHubOAuthError(
+                f"GitHub OAuth token exchange failed ({response.status_code})",
+                status_code=403,
+            )
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise GitHubClientError("Malformed JSON in GitHub OAuth token response") from exc
+
+        if not isinstance(data, dict):
+            raise GitHubClientError("Unexpected GitHub OAuth token response structure")
+
+        oauth_error = data.get("error")
+        if isinstance(oauth_error, str) and oauth_error.strip():
+            err_slug = oauth_error.strip().lower()
+            if err_slug in ("incorrect_client_credentials", "application_suspended"):
+                raise GitHubConfigurationError("GitHub OAuth client credentials were rejected")
+            if err_slug == "redirect_uri_mismatch":
+                raise GitHubOAuthError(
+                    "GitHub OAuth callback redirect URI mismatch",
+                    status_code=403,
+                )
+            raise GitHubOAuthError(
+                "GitHub OAuth authorization code is invalid, expired, or denied",
+                status_code=403,
+            )
+
+        access_token = data.get("access_token")
+        if (
+            not isinstance(access_token, str)
+            or not access_token.strip()
+            or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in access_token.strip())
+        ):
+            raise GitHubOAuthError("GitHub OAuth response did not include a valid access token")
+
+        token_type = data.get("token_type")
+        if token_type is not None and (
+            not isinstance(token_type, str) or token_type.strip().lower() != "bearer"
+        ):
+            raise GitHubOAuthError("Unsupported token_type in GitHub OAuth response")
+
+        return access_token.strip()
+
+    def get_oauth_user(self, user_access_token: str) -> GitHubOAuthUser:
+        """Fetch authenticated GitHub user identity using a user-to-server OAuth token."""
+        cleaned_token = user_access_token.strip()
+        if not cleaned_token or any(ch.isspace() for ch in cleaned_token):
+            raise GitHubOAuthError("Invalid user access token", status_code=403)
+
+        response = self._request_with_retry(
+            "GET",
+            "/user",
+            token_provider=lambda: cleaned_token,
+            max_response_bytes=1024 * 1024,
+        )
+        assert response is not None
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise GitHubClientError("Malformed JSON in GitHub user response") from exc
+
+        if not isinstance(data, dict):
+            raise GitHubClientError("Unexpected GitHub user response structure")
+
+        user_id = data.get("id")
+        login = data.get("login")
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            raise GitHubClientError("GitHub user response missing valid numeric 'id'")
+        if not isinstance(login, str) or not login.strip():
+            raise GitHubClientError("GitHub user response missing 'login'")
+
+        return GitHubOAuthUser(
+            id=user_id,
+            login=login.strip(),
+            name=_parse_optional_display_name(data.get("name")),
+            avatar_url=_parse_optional_avatar_url(data.get("avatar_url")),
+        )
+
+    def build_oauth_authorize_url(
+        self,
+        *,
+        state: str,
+        redirect_uri: str | None | _DefaultRedirectUriType = _DEFAULT_REDIRECT_URI,
+    ) -> str:
+        """Build the GitHub OAuth authorization redirect URL for user login."""
+        if not self._client_id:
+            raise GitHubConfigurationError(
+                "GitHub OAuth client ID (GITHUB_CLIENT_ID) is not configured"
+            )
+        params: dict[str, str] = {
+            "client_id": self._client_id,
+            "state": state,
+        }
+        effective_redirect = self._resolve_redirect_uri(redirect_uri)
+        if effective_redirect:
+            params["redirect_uri"] = effective_redirect
+        return f"{self._oauth_base_url}/login/oauth/authorize?{urlencode(params)}"
+
+
+class GitHubAppClient(GitHubOAuthClient):
+    """Synchronous GitHub App REST API client for backend services and worker jobs."""
+
+    def __init__(
+        self,
+        *,
+        app_id: int,
+        private_key: RSAPrivateKey,
+        base_url: str = "https://api.github.com",
+        oauth_base_url: str = "https://github.com",
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        oauth_redirect_uri: str | None = None,
+        require_https: bool | None = None,
+        timeout_sec: float = 15.0,
+        max_retries: int = 2,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        transport: httpx.BaseTransport | None = None,
+        now_fn: Callable[[], datetime] = _utc_now,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if app_id <= 0:
+            raise GitHubConfigurationError("GitHub App ID must be a positive integer")
+
+        super().__init__(
+            base_url=base_url,
+            oauth_base_url=oauth_base_url,
+            client_id=client_id,
+            client_secret=client_secret,
+            oauth_redirect_uri=oauth_redirect_uri,
+            require_https=require_https,
+            timeout_sec=timeout_sec,
+            max_retries=max_retries,
+            max_pages=max_pages,
+            transport=transport,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.app_id = app_id
+        self._private_key = private_key
+
+        self._token_lock = threading.Lock()
+        self._token_cache: dict[int, _CachedInstallationToken] = {}
+        self._refresh_locks: dict[int, threading.Lock] = {}
+
+    def __repr__(self) -> str:
+        return f"GitHubAppClient(app_id={self.app_id!r}, base_url={self.base_url!r})"
+
+    __str__ = __repr__
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        now_fn: Callable[[], datetime] = _utc_now,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> GitHubAppClient:
+        """Construct a configured GitHubAppClient from validated application Settings."""
+        if settings.GITHUB_APP_ID is None:
+            raise GitHubConfigurationError("GITHUB_APP_ID is not configured")
+
+        pem_text = settings.get_github_private_key_pem()
+        if not pem_text:
+            raise GitHubConfigurationError("GitHub App private key is not configured or unreadable")
+
+        try:
+            private_key = parse_rsa_private_key_pem(pem_text)
+        except GitHubKeyError as exc:
+            raise GitHubConfigurationError(f"Invalid GitHub App private key: {exc}") from exc
+
+        return cls(
+            app_id=settings.GITHUB_APP_ID,
+            private_key=private_key,
+            base_url=settings.GITHUB_API_BASE_URL,
+            oauth_base_url=settings.GITHUB_OAUTH_BASE_URL,
+            client_id=settings.GITHUB_CLIENT_ID,
+            client_secret=(
+                settings.GITHUB_CLIENT_SECRET.get_secret_value()
+                if settings.GITHUB_CLIENT_SECRET is not None
+                else None
+            ),
+            oauth_redirect_uri=settings.GITHUB_APP_INSTALL_CALLBACK_URL,
+            require_https=(settings.APP_ENV == "production"),
+            timeout_sec=settings.GITHUB_CLIENT_TIMEOUT_SEC,
+            transport=transport,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+
+    def clear_token_cache(self, installation_id: int | None = None) -> None:
+        """Clear cached in-memory installation token(s)."""
+        with self._token_lock:
+            if installation_id is None:
+                self._token_cache.clear()
+            else:
+                self._token_cache.pop(installation_id, None)
+
+    def _get_refresh_lock(self, installation_id: int) -> threading.Lock:
+        with self._token_lock:
+            lock = self._refresh_locks.get(installation_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._refresh_locks[installation_id] = lock
+            return lock
+
+    def _invalidate_installation_token(self, installation_id: int, failed_token: str) -> None:
+        """Evict cached token only if it matches the exact token rejected with 401."""
+        with self._token_lock:
+            cached = self._token_cache.get(installation_id)
+            if cached is not None and cached.token == failed_token:
+                self._token_cache.pop(installation_id, None)
+
+    def _create_app_jwt(self) -> str:
+        now_ts = int(self._now_fn().timestamp())
+        return create_github_app_jwt(self.app_id, self._private_key, now=now_ts)
+
     def get_installation_token(self, installation_id: int, *, force_refresh: bool = False) -> str:
         """Obtain a short-lived installation token, serialized per installation on refresh."""
         if isinstance(installation_id, bool) or installation_id <= 0:
@@ -857,136 +1144,6 @@ class GitHubAppClient:
             raise GitHubClientError("Malformed JSON in installation metadata response") from exc
 
         return self._parse_installation_dict(data)
-
-    def exchange_oauth_code(self, code: str) -> str:
-        """Exchange a single-use GitHub OAuth authorization code for a user access token."""
-        if not self._client_id or not self._client_secret:
-            raise GitHubConfigurationError(
-                "GitHub OAuth client credentials (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET) are not configured"
-            )
-
-        cleaned_code = code.strip()
-        if (
-            not cleaned_code
-            or len(cleaned_code) > 512
-            or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned_code)
-        ):
-            raise GitHubOAuthError("Invalid GitHub OAuth authorization code", status_code=403)
-
-        form_fields: dict[str, str] = {
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
-            "code": cleaned_code,
-        }
-        if self._oauth_redirect_uri:
-            form_fields["redirect_uri"] = self._oauth_redirect_uri
-
-        body_bytes = urlencode(form_fields).encode("utf-8")
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        token_url = f"{self._oauth_base_url}/login/oauth/access_token"
-
-        try:
-            with self._client.stream(
-                "POST", token_url, content=body_bytes, headers=headers
-            ) as resp:
-                response = self._read_bounded_response(resp, max_bytes=MAX_ERROR_RESPONSE_BYTES)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise GitHubTransientError(
-                f"GitHub OAuth token exchange transport error: {exc}"
-            ) from exc
-
-        if response.status_code == 429:
-            retry_after_sec, reset_at = _parse_retry_after(response, now=self._now_fn())
-            raise GitHubRateLimitError(
-                "GitHub OAuth token exchange rate limit exceeded",
-                status_code=429,
-                retry_after_sec=retry_after_sec,
-                reset_at=reset_at,
-            )
-        if response.status_code >= 500:
-            raise GitHubTransientError(
-                f"GitHub OAuth token exchange upstream error ({response.status_code})",
-                status_code=response.status_code,
-            )
-        if response.status_code in (401, 403):
-            raise GitHubOAuthError("GitHub OAuth token exchange was rejected", status_code=403)
-        if not (200 <= response.status_code < 300):
-            raise GitHubOAuthError(
-                f"GitHub OAuth token exchange failed ({response.status_code})",
-                status_code=403,
-            )
-
-        try:
-            data = response.json()
-        except Exception as exc:
-            raise GitHubClientError("Malformed JSON in GitHub OAuth token response") from exc
-
-        if not isinstance(data, dict):
-            raise GitHubClientError("Unexpected GitHub OAuth token response structure")
-
-        oauth_error = data.get("error")
-        if isinstance(oauth_error, str) and oauth_error.strip():
-            err_slug = oauth_error.strip().lower()
-            if err_slug in ("incorrect_client_credentials", "application_suspended"):
-                raise GitHubConfigurationError("GitHub OAuth client credentials were rejected")
-            if err_slug == "redirect_uri_mismatch":
-                raise GitHubOAuthError(
-                    "GitHub OAuth callback redirect URI mismatch",
-                    status_code=403,
-                )
-            raise GitHubOAuthError(
-                "GitHub OAuth authorization code is invalid, expired, or denied",
-                status_code=403,
-            )
-
-        access_token = data.get("access_token")
-        if (
-            not isinstance(access_token, str)
-            or not access_token.strip()
-            or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in access_token.strip())
-        ):
-            raise GitHubOAuthError("GitHub OAuth response did not include a valid access token")
-
-        token_type = data.get("token_type")
-        if token_type is not None and (
-            not isinstance(token_type, str) or token_type.strip().lower() != "bearer"
-        ):
-            raise GitHubOAuthError("Unsupported token_type in GitHub OAuth response")
-
-        return access_token.strip()
-
-    def get_oauth_user(self, user_access_token: str) -> GitHubOAuthUser:
-        """Fetch authenticated GitHub user identity using a user-to-server OAuth token."""
-        cleaned_token = user_access_token.strip()
-        if not cleaned_token or any(ch.isspace() for ch in cleaned_token):
-            raise GitHubOAuthError("Invalid user access token", status_code=403)
-
-        response = self._request_with_retry(
-            "GET",
-            "/user",
-            token_provider=lambda: cleaned_token,
-            max_response_bytes=1024 * 1024,
-        )
-        assert response is not None
-        try:
-            data = response.json()
-        except Exception as exc:
-            raise GitHubClientError("Malformed JSON in GitHub user response") from exc
-
-        if not isinstance(data, dict):
-            raise GitHubClientError("Unexpected GitHub user response structure")
-
-        user_id = data.get("id")
-        login = data.get("login")
-        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-            raise GitHubClientError("GitHub user response missing valid numeric 'id'")
-        if not isinstance(login, str) or not login.strip():
-            raise GitHubClientError("GitHub user response missing 'login'")
-
-        return GitHubOAuthUser(id=user_id, login=login.strip())
 
     def list_user_installations(self, user_access_token: str) -> list[GitHubInstallationInfo]:
         """List GitHub App installations accessible to the authenticated OAuth user."""

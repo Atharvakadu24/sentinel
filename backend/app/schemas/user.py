@@ -60,3 +60,32 @@ class UserResponse(BaseModel):
             last_login_at=user.last_login_at,
         )
 
+
+class GitHubAuthUrlResponse(BaseModel):
+    """Response containing the single-use GitHub OAuth authorize URL and expiration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    authorize_url: str = Field(
+        ...,
+        description="GitHub OAuth authorize URL containing a single-use CSRF state token.",
+    )
+    expires_at: datetime = Field(
+        ...,
+        description="UTC timestamp when the login OAuth state expires.",
+    )
+
+
+class GitHubAuthSessionResponse(BaseModel):
+    """Safe session confirmation returned on OAuth login callback completion (no raw token)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user: UserResponse = Field(
+        ...,
+        description="Authenticated user profile.",
+    )
+    expires_at: datetime = Field(
+        ...,
+        description="UTC timestamp when the newly issued session expires.",
+    )

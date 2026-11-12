@@ -19,10 +19,11 @@ from app.db.models.github import GitHubInstallState
 from app.db.models.observability import AIReview, WebhookEvent
 from app.db.models.project import GitHubInstallation, Project
 from app.db.models.scan import Job, Scan, ScanFinding
-from app.db.models.user import User, UserSession
+from app.db.models.user import AuthLoginState, User, UserSession
 
 __all__ = [
     "AIReview",
+    "AuthLoginState",
     "Finding",
     "FindingStatusHistory",
     "GitHubInstallState",

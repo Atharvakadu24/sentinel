@@ -23,6 +23,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.api.auth import get_github_oauth_client
 from app.api.github import get_github_client
 from app.core.config import Settings, get_settings
 from app.db.base import Base, utc_now
@@ -47,7 +48,7 @@ from app.domain.findings import (
     VerificationStatus,
 )
 from app.main import app
-from app.services.github_client import GitHubAppClient
+from app.services.github_client import GitHubAppClient, GitHubOAuthClient
 from app.worker.composite import CompositeScannerEngine
 from app.worker.runner import JobWorker
 from app.worker.scanner import (
@@ -199,7 +200,19 @@ def _client_with_overrides(
             finally:
                 client.close()
 
+        def override_gh_oauth_client() -> Generator[GitHubOAuthClient, None, None]:
+            client = GitHubOAuthClient.from_oauth_settings(
+                settings,
+                transport=github_transport,
+                sleep_fn=lambda _s: None,
+            )
+            try:
+                yield client
+            finally:
+                client.close()
+
         app.dependency_overrides[get_github_client] = override_gh_client
+        app.dependency_overrides[get_github_oauth_client] = override_gh_oauth_client
 
     try:
         with TestClient(app) as client:
@@ -2092,3 +2105,147 @@ def test_org_fails_closed_without_oauth_and_personal_remains_compatible(
         )
         assert user_oauth_ok.status_code == 200
         assert user_oauth_ok.json()["installation_id"] == 931
+
+
+def test_browser_cookie_login_to_org_installation_and_cross_state_isolation(
+    github_test_pem: str,
+    session_factory: sessionmaker[Session],
+    db_session: Session,
+    tenant_b: User,
+) -> None:
+    """Unauthenticated browser authenticates via GitHub OAuth cookie, links Org install, and stays tenant-isolated."""
+    tok_alice = "ghu" + "_" + "browseralice123456"
+    seen_redirect_uris: list[str] = []
+
+    def gh_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login/oauth/access_token":
+            body = request.content.decode("utf-8")
+            seen_redirect_uris.append(body)
+            return httpx.Response(200, json={"access_token": tok_alice, "token_type": "bearer"})
+        if request.url.path == "/user":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 9101,
+                    "login": "browser-alice",
+                    "name": "Browser Alice",
+                    "avatar_url": "https://avatars.githubusercontent.com/u/9101",
+                },
+            )
+        if request.url.path == "/app/installations/950":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 950,
+                    "account": {"id": 8801, "login": "acme-browser-org", "type": "Organization"},
+                    "permissions": {"contents": "read", "pull_requests": "write"},
+                    "suspended_at": None,
+                },
+            )
+        if request.url.path == "/user/installations":
+            return httpx.Response(
+                200,
+                json={
+                    "installations": [
+                        {
+                            "id": 950,
+                            "account": {
+                                "id": 8801,
+                                "login": "acme-browser-org",
+                                "type": "Organization",
+                            },
+                            "permissions": {"contents": "read", "pull_requests": "write"},
+                            "suspended_at": None,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        GITHUB_APP_ID=999001,
+        GITHUB_WEBHOOK_SECRET=SecretStr("webhook_test_secret_with_sufficient_entropy_1234"),
+        GITHUB_APP_PRIVATE_KEY=SecretStr(github_test_pem),
+        GITHUB_APP_SLUG="sentinel-security-bot",
+        GITHUB_STATE_TTL_SEC=300,
+        GITHUB_CLIENT_ID="Iv1.sentinelbrowserclient",
+        GITHUB_CLIENT_SECRET=SecretStr("oauth_client_secret_test_value_1234567890"),
+        GITHUB_AUTH_CALLBACK_URL="https://sentinel.example.com/auth/github/callback",
+        GITHUB_APP_INSTALL_CALLBACK_URL="https://sentinel.example.com/integrations/github/callback",
+    )
+    headers_b = _auth_headers(db_session, tenant_b)
+
+    for client in _client_with_overrides(
+        session_factory, settings, httpx.MockTransport(gh_handler)
+    ):
+        # 1. Start completely unauthenticated browser login aiming for installation setup
+        assert client.get("/me").status_code == 401
+        login_init = client.get(
+            "/auth/github/login",
+            params={"next": "/integrations/github/install"},
+        )
+        assert login_init.status_code == 200
+        login_state = parse_qs(urlparse(login_init.json()["authorize_url"]).query)["state"][0]
+
+        # Login state cannot be used on the installation callback
+        assert (
+            client.get(
+                f"/integrations/github/callback?installation_id=950&state={login_state}&code=c-org",
+                headers=headers_b,
+            ).status_code
+            == 403
+        )
+
+        # 2. Complete OAuth login callback -> redirects to /integrations/github/install with SameSite=Lax session cookie
+        login_cb = client.get(
+            f"/auth/github/callback?code=c-login&state={login_state}",
+            follow_redirects=False,
+        )
+        assert login_cb.status_code == 302
+        assert login_cb.headers["location"] == "/integrations/github/install"
+
+        # Cookie authenticates /me and /integrations/github/install
+        me_resp = client.get("/me")
+        assert me_resp.status_code == 200
+        assert me_resp.json()["github_login"] == "browser-alice"
+
+        install_init = client.get("/integrations/github/install")
+        assert install_init.status_code == 200
+        install_state = parse_qs(urlparse(install_init.json()["install_url"]).query)["state"][0]
+
+        # Install state cannot be used on login callback
+        assert (
+            client.get(
+                f"/auth/github/callback?code=c-login2&state={install_state}",
+            ).status_code
+            == 403
+        )
+
+        # 3. Complete GitHub App installation callback for Organization using session cookie
+        install_cb = client.get(
+            f"/integrations/github/callback?installation_id=950&setup_action=install&state={install_state}&code=c-org",
+        )
+        assert install_cb.status_code == 200
+        assert install_cb.json()["installation_id"] == 950
+        assert install_cb.json()["account_login"] == "acme-browser-org"
+
+        # 4. Authenticated cookie user sees installation; Tenant B cannot see or claim it
+        list_a = client.get("/integrations/github/installations")
+        assert list_a.status_code == 200
+        assert [i["installation_id"] for i in list_a.json()["items"]] == [950]
+
+    for bob_client in _client_with_overrides(
+        session_factory, settings, httpx.MockTransport(gh_handler)
+    ):
+        list_b = bob_client.get("/integrations/github/installations", headers=headers_b)
+        assert list_b.status_code == 200
+        assert list_b.json()["items"] == []
+
+    assert (
+        "redirect_uri=https%3A%2F%2Fsentinel.example.com%2Fauth%2Fgithub%2Fcallback"
+        in seen_redirect_uris[0]
+    )
+    assert (
+        "redirect_uri=https%3A%2F%2Fsentinel.example.com%2Fintegrations%2Fgithub%2Fcallback"
+        in seen_redirect_uris[1]
+    )

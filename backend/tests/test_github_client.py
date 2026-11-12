@@ -23,6 +23,8 @@ from app.services.github_client import (
     GitHubClientError,
     GitHubConfigurationError,
     GitHubNotFoundError,
+    GitHubOAuthClient,
+    GitHubOAuthUser,
     GitHubPermissionError,
     GitHubRateLimitError,
     GitHubTransientError,
@@ -1265,3 +1267,102 @@ def test_client_init_https_enforcement_and_github_enterprise_urls(
             "https://ghe.example.com/api/v3/app/installations/42",
             "https://ghe.example.com/login/oauth/access_token",
         ]
+
+
+def test_github_oauth_client_from_oauth_settings_without_app_key_and_redirect_override() -> None:
+    """GitHubOAuthClient works with client credentials only and honors redirect_uri overrides."""
+    oauth_tok = "ghu" + "_" + "oauthclientonly123456"
+    seen_forms: list[str] = []
+
+    def oauth_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login/oauth/access_token":
+            seen_forms.append(request.content.decode("utf-8"))
+            return httpx.Response(200, json={"access_token": oauth_tok, "token_type": "bearer"})
+        if request.url.path == "/user":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 707,
+                    "login": "carol",
+                    "name": "Carol Security",
+                    "avatar_url": "https://avatars.githubusercontent.com/u/707?v=4",
+                },
+            )
+        raise AssertionError(f"Unexpected path {request.url.path}")
+
+    settings = Settings(
+        GITHUB_CLIENT_ID="Iv1.oauthonlyclient",
+        GITHUB_CLIENT_SECRET=SecretStr("oauth_only_client_secret_value_12345"),
+        GITHUB_AUTH_CALLBACK_URL="https://sentinel.example.com/auth/github/callback",
+    )
+    assert not settings.is_github_app_configured()
+    assert settings.is_github_oauth_configured()
+
+    with GitHubOAuthClient.from_oauth_settings(
+        settings,
+        transport=httpx.MockTransport(oauth_handler),
+        sleep_fn=lambda _s: None,
+    ) as oauth_client:
+        auth_url = oauth_client.build_oauth_authorize_url(state="state-abc")
+        assert auth_url.startswith("https://github.com/login/oauth/authorize?")
+        assert "client_id=Iv1.oauthonlyclient" in auth_url
+        assert "state=state-abc" in auth_url
+        assert (
+            "redirect_uri=https%3A%2F%2Fsentinel.example.com%2Fauth%2Fgithub%2Fcallback" in auth_url
+        )
+
+        assert oauth_client.exchange_oauth_code("code-default") == oauth_tok
+        assert (
+            oauth_client.exchange_oauth_code(
+                "code-override",
+                redirect_uri="https://sentinel.example.com/custom/callback",
+            )
+            == oauth_tok
+        )
+        assert (
+            oauth_client.exchange_oauth_code("code-explicit-none", redirect_uri=None) == oauth_tok
+        )
+        assert oauth_client.exchange_oauth_code("code-explicit-none", redirect_uri=None) == oauth_tok
+        assert oauth_client.get_oauth_user(oauth_tok) == GitHubOAuthUser(
+            id=707,
+            login="carol",
+            name="Carol Security",
+            avatar_url="https://avatars.githubusercontent.com/u/707?v=4",
+        )
+
+    assert (
+        "redirect_uri=https%3A%2F%2Fsentinel.example.com%2Fauth%2Fgithub%2Fcallback"
+        in seen_forms[0]
+    )
+    assert "redirect_uri=https%3A%2F%2Fsentinel.example.com%2Fcustom%2Fcallback" in seen_forms[1]
+    assert "redirect_uri=" not in seen_forms[2]
+
+
+def test_github_oauth_user_ignores_non_https_avatar_url() -> None:
+    oauth_tok = "ghu" + "_" + "insecureavatar123456"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/user":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 808,
+                    "login": "dave",
+                    "name": "Dave",
+                    "avatar_url": "javascript:alert(1)",
+                },
+            )
+        raise AssertionError(f"Unexpected path {request.url.path}")
+
+    with GitHubOAuthClient(
+        client_id="Iv1.test",
+        client_secret="oauth_only_client_secret_value_12345",
+        transport=httpx.MockTransport(handler),
+        sleep_fn=lambda _s: None,
+    ) as client:
+        assert client.get_oauth_user(oauth_tok) == GitHubOAuthUser(
+            id=808,
+            login="dave",
+            name="Dave",
+            avatar_url=None,
+        )
