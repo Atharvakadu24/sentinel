@@ -1093,28 +1093,37 @@ class JobWorker:
         files_summary: list[dict[str, Any]] | None = None,
     ) -> Job:
         """Route the structured scanner execution result to job and scan state."""
-        existing_job = session.get(Job, job_id)
-        if existing_job is not None:
-            bind = session.get_bind()
-            if bind is not None and bind.dialect.name == "postgresql":
-                locked_scan = session.scalar(
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            existing_job = session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+            locked_scan = (
+                session.scalar(
                     select(Scan).where(Scan.id == existing_job.scan_id).with_for_update()
                 )
-            else:
-                locked_scan = session.get(Scan, existing_job.scan_id)
-            if locked_scan is not None and locked_scan.status in ("canceled", "superseded"):
-                logger.info(
-                    "Job %s discarding scanner results because scan %s is '%s'",
-                    job_id,
-                    locked_scan.id,
-                    locked_scan.status,
-                )
-                return self._finalize_canceled_scan_job(
-                    session=session,
-                    job_id=job_id,
-                    scan_status=locked_scan.status,
-                    current_time=current_time,
-                )
+                if existing_job is not None and existing_job.scan_id is not None
+                else None
+            )
+        else:
+            existing_job = session.get(Job, job_id)
+            locked_scan = (
+                session.get(Scan, existing_job.scan_id)
+                if existing_job is not None and existing_job.scan_id is not None
+                else None
+            )
+
+        if locked_scan is not None and locked_scan.status in ("canceled", "superseded"):
+            logger.info(
+                "Job %s discarding scanner results because scan %s is '%s'",
+                job_id,
+                locked_scan.id,
+                locked_scan.status,
+            )
+            return self._finalize_canceled_scan_job(
+                session=session,
+                job_id=job_id,
+                scan_status=locked_scan.status,
+                current_time=current_time,
+            )
 
         if scan_result.status in (ScanStatus.SUCCEEDED, ScanStatus.PARTIAL):
             scan_terminal_status = (
@@ -1323,6 +1332,8 @@ class JobWorker:
 
         logger.info("Worker %s stopped. Total jobs processed: %d", self.worker_id, processed_count)
         return processed_count
+
+
 
 
 def setup_signal_handlers(worker: JobWorker) -> None:

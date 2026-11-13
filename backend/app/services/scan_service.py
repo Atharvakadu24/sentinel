@@ -480,11 +480,6 @@ def create_github_pr_scan(
             )
             if stale_scan_ids:
                 session.execute(
-                    update(Scan)
-                    .where(Scan.id.in_(stale_scan_ids), Scan.status.in_(("queued", "running")))
-                    .values(status="superseded", finished_at=current_time)
-                )
-                session.execute(
                     update(Job)
                     .where(Job.scan_id.in_(stale_scan_ids), Job.status == "queued")
                     .values(
@@ -493,6 +488,11 @@ def create_github_pr_scan(
                         payload=None,
                         updated_at=current_time,
                     )
+                )
+                session.execute(
+                    update(Scan)
+                    .where(Scan.id.in_(stale_scan_ids), Scan.status.in_(("queued", "running")))
+                    .values(status="superseded", finished_at=current_time)
                 )
             session.add(scan)
             session.add(job)

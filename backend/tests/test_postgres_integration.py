@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -15,9 +17,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 import app.db.models  # noqa: F401  Ensure every ORM model is registered on Base.metadata
-from app.db.base import Base
-from app.db.models import GitHubInstallation, Project, Scan, User, UserSession
+from app.db.base import Base, utc_now
+from app.db.models import GitHubInstallation, Job, Project, Scan, User, UserSession
 from app.db.session import session_scope
+from app.services.scan_service import create_github_pr_scan
+from app.worker.runner import JobWorker
+from app.worker.scanner import ScanExecutionResult, ScanStatus
 from tests.conftest import PostgresRecordCleanup, validate_postgres_test_url
 
 
@@ -580,3 +585,637 @@ class TestPostgresConstraintsAndPartialIndexes:
                     full_name=f"pg-org-{tag}/repo-missing",
                 )
             )
+
+
+def _setup_github_project(
+    session: Session,
+    pg_cleanup: PostgresRecordCleanup,
+    tag: str,
+) -> tuple[User, GitHubInstallation, Project]:
+    """Helper to provision a clean GitHub-connected project for PR tests."""
+    ext_user_id = _random_positive_int()
+    ext_install_id = _random_positive_int()
+    ext_repo_id = _random_positive_int(500_000_000)
+
+    user = User(
+        github_user_id=ext_user_id,
+        github_login=f"user-{tag}",
+    )
+    session.add(user)
+    session.flush()
+    pg_cleanup.track(User, user.id)
+
+    installation = GitHubInstallation(
+        installation_id=ext_install_id,
+        owner_user_id=user.id,
+        account_login=f"org-{tag}",
+        account_type="Organization",
+        status="active",
+        permissions={"pull_requests": "write"},
+    )
+    session.add(installation)
+    session.flush()
+    pg_cleanup.track(GitHubInstallation, installation.id)
+
+    project = Project(
+        owner_user_id=user.id,
+        kind="github",
+        name=f"repo-{tag}",
+        installation_id=installation.id,
+        github_repo_id=ext_repo_id,
+        full_name=f"org-{tag}/repo-{tag}",
+        default_branch="main",
+        status="active",
+    )
+    session.add(project)
+    session.flush()
+    pg_cleanup.track(Project, project.id)
+
+    return user, installation, project
+
+
+def _wait_for_blocked_transaction(
+    engine: Engine,
+    backend_pid: int,
+    timeout_sec: float = 3.0,
+) -> bool:
+    """Wait until the specified PostgreSQL backend is waiting for a lock."""
+    deadline = time.monotonic() + timeout_sec
+
+    with engine.connect() as conn:
+        while time.monotonic() < deadline:
+            blocked = conn.execute(
+                sa.text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks
+                        WHERE pid = :backend_pid
+                          AND NOT granted
+                    )
+                    """
+                ),
+                {"backend_pid": backend_pid},
+            ).scalar_one()
+
+            if blocked:
+                return True
+
+            time.sleep(0.02)
+
+    return False
+
+
+@pytest.mark.postgres
+class TestPostgresLockOrderingAndConcurrency:
+    """Verify global row-lock ordering (Job -> Scan) and deadlock-free concurrency."""
+
+    def test_pr_supersession_fails_queued_job_and_supersedes_scan(
+        self,
+        pg_session_factory: sessionmaker[Session],
+        pg_cleanup: PostgresRecordCleanup,
+    ) -> None:
+        """PR supersession marks stale queued jobs as failed and supersedes stale scans."""
+        tag = _suffix()
+        sha_v1 = "1" * 40
+        sha_v2 = "2" * 40
+        pr_number = 101
+
+        with session_scope(pg_session_factory) as session:
+            _user, installation, project = _setup_github_project(session, pg_cleanup, tag)
+            scan_1, job_1 = create_github_pr_scan(
+                session,
+                project_id=project.id,
+                installation_id=installation.installation_id,
+                github_repo_id=project.github_repo_id,
+                full_name=project.full_name,
+                pr_number=pr_number,
+                head_sha=sha_v1,
+            )
+            pg_cleanup.track(Job, job_1.id)
+            pg_cleanup.track(Scan, scan_1.id)
+            scan_1_id = scan_1.id
+            job_1_id = job_1.id
+            project_id = project.id
+            install_id = installation.installation_id
+            repo_id = project.github_repo_id
+            full_name = project.full_name
+
+        # Initial state verification
+        with session_scope(pg_session_factory) as session:
+            j1 = session.get(Job, job_1_id)
+            s1 = session.get(Scan, scan_1_id)
+            assert j1 is not None and j1.status == "queued"
+            assert s1 is not None and s1.status == "queued"
+
+        # Supersede with newer commit
+        with session_scope(pg_session_factory) as session:
+            scan_2, job_2 = create_github_pr_scan(
+                session,
+                project_id=project_id,
+                installation_id=install_id,
+                github_repo_id=repo_id,
+                full_name=full_name,
+                pr_number=pr_number,
+                head_sha=sha_v2,
+            )
+            pg_cleanup.track(Job, job_2.id)
+            pg_cleanup.track(Scan, scan_2.id)
+            scan_2_id = scan_2.id
+            job_2_id = job_2.id
+
+        # Verify final states: queued job failed, stale scan superseded, new scan queued
+        with session_scope(pg_session_factory) as session:
+            s1 = session.get(Scan, scan_1_id)
+            j1 = session.get(Job, job_1_id)
+            s2 = session.get(Scan, scan_2_id)
+            j2 = session.get(Job, job_2_id)
+
+            assert s1 is not None
+            assert s1.status == "superseded"
+            assert s1.finished_at is not None
+
+            assert j1 is not None
+            assert j1.status == "failed"
+            assert j1.last_error == "Superseded by newer pull request commit"
+            assert j1.payload is None
+
+            assert s2 is not None
+            assert s2.status == "queued"
+            assert s2.head_sha == sha_v2
+
+            assert j2 is not None
+            assert j2.status == "queued"
+
+    def test_pr_supersession_preserves_running_job_and_worker_aborts_result(
+        self,
+        pg_session_factory: sessionmaker[Session],
+        pg_cleanup: PostgresRecordCleanup,
+    ) -> None:
+        """PR supersession supersedes running scans but leaves running jobs for worker cancellation."""
+        tag = _suffix()
+        sha_v1 = "a" * 40
+        sha_v2 = "b" * 40
+        pr_number = 102
+        worker_id = f"worker-test-{tag}"
+
+        with session_scope(pg_session_factory) as session:
+            _user, installation, project = _setup_github_project(session, pg_cleanup, tag)
+            scan_1, job_1 = create_github_pr_scan(
+                session,
+                project_id=project.id,
+                installation_id=installation.installation_id,
+                github_repo_id=project.github_repo_id,
+                full_name=project.full_name,
+                pr_number=pr_number,
+                head_sha=sha_v1,
+            )
+            pg_cleanup.track(Job, job_1.id)
+            pg_cleanup.track(Scan, scan_1.id)
+            scan_1_id = scan_1.id
+            job_1_id = job_1.id
+            project_id = project.id
+            install_id = installation.installation_id
+            repo_id = project.github_repo_id
+            full_name = project.full_name
+
+        # Worker claims job_1
+        claim_time = utc_now()
+        with session_scope(pg_session_factory) as session:
+            session.execute(
+                sa.update(Job)
+                .where(Job.id == job_1_id)
+                .values(
+                    status="running",
+                    locked_by=worker_id,
+                    locked_until=claim_time + timedelta(seconds=300),
+                    attempts=1,
+                )
+            )
+            session.execute(
+                sa.update(Scan)
+                .where(Scan.id == scan_1_id)
+                .values(status="running", started_at=claim_time)
+            )
+
+        # PR supersession occurs while worker is running
+        with session_scope(pg_session_factory) as session:
+            scan_2, job_2 = create_github_pr_scan(
+                session,
+                project_id=project_id,
+                installation_id=install_id,
+                github_repo_id=repo_id,
+                full_name=full_name,
+                pr_number=pr_number,
+                head_sha=sha_v2,
+            )
+            pg_cleanup.track(Job, job_2.id)
+            pg_cleanup.track(Scan, scan_2.id)
+
+        # Verify running job is preserved in running state while scan is superseded
+        with session_scope(pg_session_factory) as session:
+            j1 = session.get(Job, job_1_id)
+            s1 = session.get(Scan, scan_1_id)
+            assert s1 is not None and s1.status == "superseded"
+            assert j1 is not None and j1.status == "running"
+            assert j1.locked_by == worker_id
+
+        # Worker finishes and routes result through _handle_scan_result
+        runner = JobWorker(session_factory=pg_session_factory, worker_id=worker_id)
+        scan_result = ScanExecutionResult(
+            status=ScanStatus.SUCCEEDED,
+            findings=[],
+            counts={"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+        )
+        with session_scope(pg_session_factory) as session:
+            finalized_job = runner._handle_scan_result(
+                session=session,
+                job_id=job_1_id,
+                scan_result=scan_result,
+                current_time=utc_now(),
+            )
+            assert finalized_job.status == "failed"
+            assert "superseded" in (finalized_job.last_error or "").lower()
+
+        # Final verification: scan was not overwritten to succeeded
+        with session_scope(pg_session_factory) as session:
+            s1 = session.get(Scan, scan_1_id)
+            j1 = session.get(Job, job_1_id)
+            assert s1 is not None and s1.status == "superseded"
+            assert j1 is not None and j1.status == "failed"
+            assert j1.locked_by is None
+
+    def test_pr_supersession_acquires_job_lock_before_scan_lock(
+        self,
+        pg_engine: Engine,
+        pg_session_factory: sessionmaker[Session],
+        pg_cleanup: PostgresRecordCleanup,
+    ) -> None:
+        """PR supersession blocks on Job lock before touching Scan lock."""
+        tag = _suffix()
+        sha_v1 = "c" * 40
+        sha_v2 = "d" * 40
+        pr_number = 103
+
+        with session_scope(pg_session_factory) as session:
+            _user, installation, project = _setup_github_project(session, pg_cleanup, tag)
+            scan_1, job_1 = create_github_pr_scan(
+                session,
+                project_id=project.id,
+                installation_id=installation.installation_id,
+                github_repo_id=project.github_repo_id,
+                full_name=project.full_name,
+                pr_number=pr_number,
+                head_sha=sha_v1,
+            )
+            pg_cleanup.track(Job, job_1.id)
+            pg_cleanup.track(Scan, scan_1.id)
+            scan_1_id = scan_1.id
+            job_1_id = job_1.id
+            project_id = project.id
+            install_id = installation.installation_id
+            repo_id = project.github_repo_id
+            full_name = project.full_name
+
+        # Hold exclusive Job lock in Session A
+        session_a = pg_session_factory()
+        session_a.execute(sa.text("SET lock_timeout = '4000ms'"))
+        session_a.execute(sa.select(Job).where(Job.id == job_1_id).with_for_update())
+
+        thread_done = threading.Event()
+        backend_pid_ready = threading.Event()
+        backend_pid: list[int] = []
+        thread_errors: list[Exception] = []
+
+        def supersede_worker() -> None:
+            try:
+                with session_scope(pg_session_factory) as session_b:
+                    session_b.execute(sa.text("SET lock_timeout = '4000ms'"))
+                    backend_pid.append(
+                        session_b.scalar(sa.text("SELECT pg_backend_pid()"))
+                    )
+                    backend_pid_ready.set()
+
+                    s2, j2 = create_github_pr_scan(
+                        session_b,
+                        project_id=project_id,
+                        installation_id=install_id,
+                        github_repo_id=repo_id,
+                        full_name=full_name,
+                        pr_number=pr_number,
+                        head_sha=sha_v2,
+                        auto_commit=True,
+                    )
+                    pg_cleanup.track(Job, j2.id)
+                    pg_cleanup.track(Scan, s2.id)
+
+                thread_done.set()
+            except Exception as exc:  # noqa: BLE001
+                thread_errors.append(exc)
+                backend_pid_ready.set()
+
+        thread = threading.Thread(target=supersede_worker, daemon=True)
+
+        try:
+            thread.start()
+
+            assert backend_pid_ready.wait(timeout=3.0), (
+                "Thread B did not initialize its PostgreSQL connection"
+            )
+            assert backend_pid, "Thread B did not report its PostgreSQL backend PID"
+
+            blocked = _wait_for_blocked_transaction(
+                pg_engine,
+                backend_pid[0],
+                timeout_sec=3.0,
+            )
+            assert blocked, "Thread B did not block on the expected Job lock"
+            assert not thread_done.is_set(), (
+                "Thread B should be blocked waiting for Job lock"
+            )
+
+            scan_locked = session_a.scalar(
+                sa.select(Scan)
+                .where(Scan.id == scan_1_id)
+                .with_for_update(nowait=True)
+            )
+            assert scan_locked is not None, (
+                "Scan must not be locked by Thread B before its Job lock"
+            )
+
+        finally:
+            session_a.rollback()
+            session_a.close()
+            if thread.ident is not None:
+                thread.join(timeout=6.0)
+
+        assert not thread.is_alive(), "Thread B failed to terminate within timeout"
+        assert not thread_errors, f"Thread B encountered error: {thread_errors}"
+        assert thread_done.is_set()
+
+    def test_worker_result_acquires_job_lock_before_scan_lock(
+        self,
+        pg_engine: Engine,
+        pg_session_factory: sessionmaker[Session],
+        pg_cleanup: PostgresRecordCleanup,
+    ) -> None:
+        """Worker _handle_scan_result blocks on Job lock before touching Scan lock."""
+        tag = _suffix()
+        sha_v1 = "e" * 40
+        pr_number = 104
+        worker_id = f"worker-order-{tag}"
+
+        with session_scope(pg_session_factory) as session:
+            _user, installation, project = _setup_github_project(session, pg_cleanup, tag)
+            scan_1, job_1 = create_github_pr_scan(
+                session,
+                project_id=project.id,
+                installation_id=installation.installation_id,
+                github_repo_id=project.github_repo_id,
+                full_name=project.full_name,
+                pr_number=pr_number,
+                head_sha=sha_v1,
+            )
+            pg_cleanup.track(Job, job_1.id)
+            pg_cleanup.track(Scan, scan_1.id)
+            scan_1_id = scan_1.id
+            job_1_id = job_1.id
+
+        # Worker claims job
+        claim_time = utc_now()
+        with session_scope(pg_session_factory) as session:
+            session.execute(
+                sa.update(Job)
+                .where(Job.id == job_1_id)
+                .values(
+                    status="running",
+                    locked_by=worker_id,
+                    locked_until=claim_time + timedelta(seconds=300),
+                    attempts=1,
+                )
+            )
+            session.execute(
+                sa.update(Scan)
+                .where(Scan.id == scan_1_id)
+                .values(status="running", started_at=claim_time)
+            )
+
+        # Hold exclusive Job lock in Session A
+        session_a = pg_session_factory()
+        session_a.execute(sa.text("SET lock_timeout = '4000ms'"))
+        session_a.execute(sa.select(Job).where(Job.id == job_1_id).with_for_update())
+
+        thread_done = threading.Event()
+        backend_pid_ready = threading.Event()
+        backend_pid: list[int] = []
+        thread_errors: list[Exception] = []
+
+        runner = JobWorker(session_factory=pg_session_factory, worker_id=worker_id)
+        scan_result = ScanExecutionResult(
+            status=ScanStatus.SUCCEEDED,
+            findings=[],
+            counts={"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+        )
+
+        def worker_task() -> None:
+            try:
+                with session_scope(pg_session_factory) as session_b:
+                    session_b.execute(sa.text("SET lock_timeout = '4000ms'"))
+                    backend_pid.append(
+                        session_b.scalar(sa.text("SELECT pg_backend_pid()"))
+                    )
+                    backend_pid_ready.set()
+
+                    runner._handle_scan_result(
+                        session=session_b,
+                        job_id=job_1_id,
+                        scan_result=scan_result,
+                        current_time=utc_now(),
+                    )
+
+                thread_done.set()
+            except Exception as exc:  # noqa: BLE001
+                thread_errors.append(exc)
+                backend_pid_ready.set()
+
+        thread = threading.Thread(target=worker_task, daemon=True)
+
+        try:
+            thread.start()
+
+            assert backend_pid_ready.wait(timeout=3.0), (
+                "Worker thread did not initialize its PostgreSQL connection"
+            )
+            assert backend_pid, "Worker thread did not report its PostgreSQL backend PID"
+
+            blocked = _wait_for_blocked_transaction(
+                pg_engine,
+                backend_pid[0],
+                timeout_sec=3.0,
+            )
+            assert blocked, "Worker thread did not block on the expected Job lock"
+            assert not thread_done.is_set(), (
+                "Worker thread should be blocked waiting for Job lock"
+            )
+
+            scan_locked = session_a.scalar(
+                sa.select(Scan)
+                .where(Scan.id == scan_1_id)
+                .with_for_update(nowait=True)
+            )
+            assert scan_locked is not None, (
+                "Scan must not be locked by worker before its Job lock"
+            )
+
+        finally:
+            session_a.rollback()
+            session_a.close()
+            if thread.ident is not None:
+                thread.join(timeout=6.0)
+
+        assert not thread.is_alive(), "Worker thread failed to terminate within timeout"
+        assert not thread_errors, f"Worker thread encountered error: {thread_errors}"
+        assert thread_done.is_set()
+
+    def test_concurrent_pr_supersession_and_worker_result_no_deadlock(
+        self,
+        pg_session_factory: sessionmaker[Session],
+        pg_cleanup: PostgresRecordCleanup,
+    ) -> None:
+        """Simultaneous PR supersession and worker completion contend without deadlock."""
+        tag = _suffix()
+        sha_v1 = "f" * 40
+        sha_v2 = "0" * 40
+        pr_number = 105
+        worker_id = f"worker-race-{tag}"
+
+        with session_scope(pg_session_factory) as session:
+            _user, installation, project = _setup_github_project(session, pg_cleanup, tag)
+            scan_1, job_1 = create_github_pr_scan(
+                session,
+                project_id=project.id,
+                installation_id=installation.installation_id,
+                github_repo_id=project.github_repo_id,
+                full_name=project.full_name,
+                pr_number=pr_number,
+                head_sha=sha_v1,
+            )
+            pg_cleanup.track(Job, job_1.id)
+            pg_cleanup.track(Scan, scan_1.id)
+            scan_1_id = scan_1.id
+            job_1_id = job_1.id
+            project_id = project.id
+            install_id = installation.installation_id
+            repo_id = project.github_repo_id
+            full_name = project.full_name
+
+        # Worker claims job_1
+        claim_time = utc_now()
+        with session_scope(pg_session_factory) as session:
+            session.execute(
+                sa.update(Job)
+                .where(Job.id == job_1_id)
+                .values(
+                    status="running",
+                    locked_by=worker_id,
+                    locked_until=claim_time + timedelta(seconds=300),
+                    attempts=1,
+                )
+            )
+            session.execute(
+                sa.update(Scan)
+                .where(Scan.id == scan_1_id)
+                .values(status="running", started_at=claim_time)
+            )
+
+        supersede_ready = threading.Event()
+        worker_started = threading.Event()
+        release_supersede = threading.Event()
+        errors: list[tuple[str, Exception]] = []
+
+        runner = JobWorker(session_factory=pg_session_factory, worker_id=worker_id)
+        scan_result = ScanExecutionResult(
+            status=ScanStatus.SUCCEEDED,
+            findings=[],
+            counts={"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+        )
+
+        def supersede_task() -> None:
+            try:
+                with session_scope(pg_session_factory) as session:
+                    session.execute(sa.text("SET lock_timeout = '4000ms'"))
+                    s2, j2 = create_github_pr_scan(
+                        session,
+                        project_id=project_id,
+                        installation_id=install_id,
+                        github_repo_id=repo_id,
+                        full_name=full_name,
+                        pr_number=pr_number,
+                        head_sha=sha_v2,
+                        auto_commit=False,
+                    )
+                    pg_cleanup.track(Job, j2.id)
+                    pg_cleanup.track(Scan, s2.id)
+                    supersede_ready.set()
+
+                    if not worker_started.wait(timeout=5.0):
+                        raise AssertionError("Worker did not start during supersession")
+
+                    if not release_supersede.wait(timeout=5.0):
+                        raise AssertionError("Timed out waiting to release supersession")
+
+                    session.commit()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("supersede", exc))
+                supersede_ready.set()
+
+        def worker_task() -> None:
+            try:
+                if not supersede_ready.wait(timeout=5.0):
+                    raise AssertionError("Supersession did not reach its transaction")
+
+                with session_scope(pg_session_factory) as session:
+                    session.execute(sa.text("SET lock_timeout = '4000ms'"))
+                    worker_started.set()
+                    runner._handle_scan_result(
+                        session=session,
+                        job_id=job_1_id,
+                        scan_result=scan_result,
+                        current_time=utc_now(),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("worker", exc))
+                worker_started.set()
+
+        t1 = threading.Thread(target=supersede_task, daemon=True)
+        t2 = threading.Thread(target=worker_task, daemon=True)
+
+        try:
+            t1.start()
+            t2.start()
+
+            assert supersede_ready.wait(timeout=5.0), (
+                "Supersession did not reach its transaction"
+            )
+            assert worker_started.wait(timeout=5.0), (
+                "Worker did not start while supersession was in progress"
+            )
+        finally:
+            release_supersede.set()
+            t1.join(timeout=7.0)
+            t2.join(timeout=7.0)
+
+        assert not t1.is_alive(), "Supersede thread timed out"
+        assert not t2.is_alive(), "Worker thread timed out"
+        assert not errors, f"Concurrent contention produced errors: {errors}"
+
+        # Verify the old scan remains superseded and its job is finalized.
+        with session_scope(pg_session_factory) as session:
+            s1 = session.get(Scan, scan_1_id)
+            j1 = session.get(Job, job_1_id)
+            assert s1 is not None
+            assert j1 is not None
+            assert s1.status == "superseded"
+            assert j1.status == "failed"
+            assert "superseded" in (j1.last_error or "").lower()
+            assert j1.locked_by is None
